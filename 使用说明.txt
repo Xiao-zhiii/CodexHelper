@@ -27,6 +27,25 @@
      优先使用 npmmirror 国内镜像；超过 5 分钟未完成会自动切换 npm 官方源重试。
 6. 安装完成后，打开【新的】PowerShell 或 CMD 窗口，输入 codex 即可使用。
 
+【Codex 插件一键修复】（v1.2.0 新增）
+适用场景：Codex 桌面端升级后，Chrome 插件 / 浏览器插件 /
+Computer Use（电脑操作）插件无法使用、按钮变灰或功能消失。
+点击界面上的【🛠 一键修复 Codex 插件】，程序会自动完成：
+1. 检测本机是否已安装修复技能 codex-windows-fast-patch-skill，
+   没有则自动从 GitHub 下载安装（多个下载源自动切换）；
+2. 把 Codex 权限自动设置为 Full Access
+   （写入 ~/.codex/config.toml，原配置自动备份为
+   config.toml.nodecodexsetup.bak）；
+3. 写入 /goal 自定义指令（~/.codex/prompts/goal.md），
+   之后你在 codex 里随时输入 /goal 也能调取修复技能；
+4. 自动打开一个新的 Codex CLI 窗口（Full Access 模式），
+   自动确认“目录信任”提示，并自动输入修复指令开始排查修复。
+注意：
+· 需要先安装好 Codex CLI（可用本工具先安装）；
+· 自动输入被系统拦截时，修复指令已复制到剪贴板，
+  手动到 Codex 窗口按 Ctrl+V 回车即可；
+· 修复过程由 Codex 自主执行，请在其窗口内确认与观察。
+
 【Codex CLI 首次使用】
 需要配置 OpenAI API Key（在新的终端窗口执行，setx 永久生效）：
     setx OPENAI_API_KEY "sk-你的key"
@@ -63,7 +82,7 @@
       --add-data "installer.ico;assets" \
       node_codex_installer.py
 
-生成日期：2026-08-27
+生成日期：2026-08-29（v1.2.0）
 
 ═══════════════════════════════════════════════════════
  版权与声明

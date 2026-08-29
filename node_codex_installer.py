@@ -6,6 +6,7 @@ Node.js + Codex CLI 一键安装器（独立 exe 版）
 本程序由 小枳ai分享 制作并分享，转载/二次分发请保留本版权声明。
 """
 import base64
+import io
 import json
 import os
 import queue
@@ -17,12 +18,14 @@ import threading
 import time
 import traceback
 import urllib.request
+import zipfile
 
 CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_CONSOLE = 0x00000010
 
 APP_TITLE = "Node.js + Codex CLI 一键安装器"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -47,6 +50,29 @@ MIRROR_REGISTRY = "https://registry.npmmirror.com"
 MIRROR_TIMEOUT_SEC = 300        # 镜像源超过 5 分钟未成功 → 切换官方源（《命令.txt》要求）
 OFFICIAL_TIMEOUT_SEC = 900      # 官方源最长等待
 MSI_TIMEOUT_SEC = 1200
+
+# ---- Codex 插件修复（v1.2.0 新增）----
+SKILL_REPO = "Xiao-zhiii/codex-windows-fast-patch-skill"
+SKILL_DIR_NAME = "codex-windows-fast-patch-skill"
+SKILL_ZIP_URLS = [
+    "https://codeload.github.com/" + SKILL_REPO + "/zip/refs/heads/main",
+    "https://codeload.github.com/" + SKILL_REPO + "/zip/refs/heads/master",
+    "https://ghproxy.net/https://github.com/" + SKILL_REPO + "/archive/refs/heads/main.zip",
+    "https://gh-proxy.com/https://github.com/" + SKILL_REPO + "/archive/refs/heads/main.zip",
+]
+# 用户指定的修复目标提示词（自动输入到 codex TUI）
+FIX_PROMPT = ("排查并修复本机codex桌面端无法调用chrome插件，浏览器插件，"
+              "computer use插件无法使用的问题")
+FIX_COMMAND = "/goal " + FIX_PROMPT
+CODEX_BOOT_WAIT_SEC = 10        # codex 窗口出现后再等 TUI 就绪的秒数
+GOAL_MD_BODY = """请先完整阅读本机已安装的技能文件：~/.codex/skills/codex-windows-fast-patch-skill/SKILL.md
+
+该技能用于恢复 Windows Codex Desktop 升级后失效的补丁与能力开关（Chrome / 浏览器插件、Computer Use 等）。
+请严格按照 SKILL.md 中的步骤执行。
+
+本次目标：{prompt}
+
+完成后请逐项验证 Chrome 插件 / 浏览器插件 / Computer Use 是否恢复可用，并给出结果摘要。"""
 
 COMMON_NODE_DIRS = [
     r"C:\Program Files\nodejs",
@@ -242,6 +268,346 @@ def detect():
             info["codex_shim"] = w
             info["codex_ver"] = "已安装"
     return info
+
+
+# ------------------------------------------------- Codex 插件修复（v1.2.0）--
+
+def codex_home(home=None) -> str:
+    """Codex CLI 数据目录（~/.codex）。home 参数用于测试时重定向。"""
+    return os.path.join(home or os.path.expanduser("~"), ".codex")
+
+
+def find_patch_skill(home=None):
+    """检测本机是否已安装 fast-patch 修复技能，返回技能目录；未安装返回 None。"""
+    skills = os.path.join(codex_home(home), "skills")
+    for n in (SKILL_DIR_NAME, "codex-windows-fast-patch"):
+        p = os.path.join(skills, n, "SKILL.md")
+        if os.path.isfile(p):
+            return os.path.dirname(p)
+    if os.path.isdir(skills):
+        for d in os.listdir(skills):
+            if "fast-patch" in d.lower():
+                p = os.path.join(skills, d, "SKILL.md")
+                if os.path.isfile(p):
+                    return os.path.dirname(p)
+    return None
+
+
+def install_patch_skill(log=print, home=None) -> str:
+    """从 GitHub 下载技能仓库 zip，解压安装到 ~/.codex/skills/<技能名>/。"""
+    dest = os.path.join(codex_home(home), "skills", SKILL_DIR_NAME)
+    data = None
+    for url in SKILL_ZIP_URLS:
+        try:
+            log("下载修复技能：" + url)
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = resp.read()
+            if len(data) < 1024:
+                raise IOError("下载内容异常（过小）")
+            break
+        except Exception as e:
+            log(f"该下载源失败：{e}", "warn")
+            data = None
+    if data is None:
+        raise RuntimeError(
+            "所有下载源均失败，无法下载修复技能。请检查网络，或手动从 "
+            f"https://github.com/{SKILL_REPO} 下载 zip 解压到：{dest}")
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.rmtree(dest, ignore_errors=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [n for n in zf.namelist() if n.strip("/")]
+        tops = {n.split("/")[0] for n in names}
+        root = ""
+        if len(tops) == 1:
+            cand = next(iter(tops))
+            if all(n == cand or n.startswith(cand + "/") for n in names):
+                root = cand + "/"
+        for n in names:
+            rel = n[len(root):] if root else n
+            if not rel or rel.endswith("/"):
+                continue
+            rel = rel.replace("/", os.sep)
+            if rel.startswith("..") or os.path.isabs(rel):
+                continue  # 防路径穿越
+            target = os.path.join(dest, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with zf.open(n) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+    if not os.path.isfile(os.path.join(dest, "SKILL.md")):
+        raise RuntimeError("技能包解压后未找到 SKILL.md，安装失败。")
+    log(f"修复技能安装完成：{dest}", "ok")
+    return dest
+
+
+def ensure_full_access(log=print, home=None) -> str:
+    """把 Codex 权限设为 Full Access：在 ~/.codex/config.toml 顶部写入
+    approval_policy = "never" 与 sandbox_mode = "danger-full-access"。
+    已有同名键会被移除后统一写回顶部；文件其余内容（含各 [table] 段）原样保留，
+    原文件备份为 config.toml.nodecodexsetup.bak。"""
+    cfg = os.path.join(codex_home(home), "config.toml")
+    os.makedirs(os.path.dirname(cfg), exist_ok=True)
+    had = os.path.isfile(cfg)
+    old = ""
+    if had:
+        with open(cfg, "r", encoding="utf-8", errors="replace") as f:
+            old = f.read()
+        try:
+            shutil.copy2(cfg, cfg + ".nodecodexsetup.bak")
+        except Exception:
+            pass
+    kept = [ln for ln in old.splitlines()
+            if not re.match(r"^(approval_policy|sandbox_mode)\s*=", ln)]
+    header = [
+        "# ---- 由 NodeCodexSetup（小枳ai分享）设置：Codex Full Access 权限 ----",
+        'approval_policy = "never"',
+        'sandbox_mode = "danger-full-access"',
+        "",
+    ]
+    with open(cfg, "w", encoding="utf-8") as f:
+        f.write("\n".join(header + kept).rstrip("\n") + "\n")
+    log("Codex 权限已设置为 Full Access（approval_policy=never、"
+        "sandbox_mode=danger-full-access）", "ok")
+    if had:
+        log("原配置已备份为 config.toml.nodecodexsetup.bak")
+    return cfg
+
+
+def ensure_goal_prompt(log=print, home=None) -> str:
+    """写入 ~/.codex/prompts/goal.md，使 codex TUI 中输入 /goal 即自动调取
+    fast-patch 技能执行插件修复（codex 会把 prompts 目录下的 .md 注册为斜杠命令）。"""
+    pdir = os.path.join(codex_home(home), "prompts")
+    os.makedirs(pdir, exist_ok=True)
+    p = os.path.join(pdir, "goal.md")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(GOAL_MD_BODY.format(prompt=FIX_PROMPT))
+    log("已写入 /goal 自定义指令：" + p, "ok")
+    return p
+
+
+def find_window_by_title(substr, timeout=20, poll=0.3, cancel_event=None):
+    """轮询查找标题包含 substr 的可见顶层窗口，返回 hwnd(int)；超时或取消返回 None。"""
+    import ctypes
+    u = ctypes.windll.user32
+    Proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    hits = []
+
+    def on_window(hwnd, _lparam):
+        if u.IsWindowVisible(hwnd):
+            n = u.GetWindowTextLengthW(hwnd)
+            if n > 0:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(hwnd, buf, n + 1)
+                if substr in buf.value:
+                    hits.append(int(hwnd or 0))
+        return 1
+
+    t0 = time.time()
+    while True:
+        del hits[:]
+        u.EnumWindows(Proc(on_window), None)
+        if hits:
+            return hits[0]
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if time.time() - t0 >= timeout:
+            return None
+        time.sleep(poll)
+
+
+def _set_clipboard_text(text) -> bool:
+    """ctypes 写剪贴板（CF_UNICODETEXT），可在后台线程调用，不依赖 tkinter。
+    注意：GlobalAlloc/GlobalLock/SetClipboardData 的句柄是 64 位，
+    必须显式声明 restype/argtypes，否则会被按 32 位截断导致锁定失败。"""
+    import ctypes
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    CF_UNICODETEXT, GMEM_MOVEABLE = 13, 0x0002
+    k.GlobalAlloc.restype = ctypes.c_void_p
+    k.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    k.GlobalLock.restype = ctypes.c_void_p
+    k.GlobalLock.argtypes = [ctypes.c_void_p]
+    k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    u.SetClipboardData.restype = ctypes.c_void_p
+    u.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+    opened = False
+    for _ in range(10):          # 剪贴板可能被其它程序短暂占用，重试
+        if u.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.1)
+    if not opened:
+        return False
+    try:
+        u.EmptyClipboard()
+        buf = ctypes.create_unicode_buffer(text)
+        h = k.GlobalAlloc(GMEM_MOVEABLE, ctypes.sizeof(buf))
+        if not h:
+            return False
+        p = k.GlobalLock(h)
+        if not p:
+            return False
+        ctypes.memmove(p, buf, ctypes.sizeof(buf))
+        k.GlobalUnlock(h)
+        if not u.SetClipboardData(CF_UNICODETEXT, h):
+            return False
+        return True
+    finally:
+        u.CloseClipboard()
+
+
+def _keybd(vk, up=False):
+    import ctypes
+    ctypes.windll.user32.keybd_event(vk, 0, 2 if up else 0, 0)
+
+
+def focus_window(hwnd) -> bool:
+    """把窗口带到前台；成功返回 True。"""
+    import ctypes
+    u = ctypes.windll.user32
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    hwnd = int(hwnd)
+    for _ in range(3):
+        u.ShowWindow(hwnd, 9)              # SW_RESTORE
+        _keybd(0x12)
+        _keybd(0x12, True)                 # 轻敲 ALT 解除前台切换限制
+        u.SetForegroundWindow(hwnd)
+        time.sleep(0.5)
+        if int(u.GetForegroundWindow() or 0) == hwnd:
+            return True
+    return int(u.GetForegroundWindow() or 0) == hwnd
+
+
+def focus_and_paste(hwnd, text) -> bool:
+    """把目标窗口带到前台，用剪贴板 + Ctrl+V 粘贴 text 后回车。
+    仅在确认目标窗口已在前台时才粘贴，避免误输入到其它窗口。"""
+    import ctypes
+    u = ctypes.windll.user32
+    if not focus_window(hwnd):
+        return False
+    if not _set_clipboard_text(text):
+        return False
+    time.sleep(0.2)
+    _keybd(0x11)
+    _keybd(0x56)                           # Ctrl+V
+    _keybd(0x56, True)
+    _keybd(0x11, True)
+    time.sleep(0.4)
+    _keybd(0x0D)
+    _keybd(0x0D, True)                     # 回车发送
+    return True
+
+
+def send_enter_to_window(hwnd) -> bool:
+    """把窗口带到前台后发送一次回车（用于确认 codex 的目录信任提示；
+    若 codex 已直接进入主界面，空的回车不会产生任何输入）。"""
+    import ctypes
+    if not focus_window(hwnd):
+        return False
+    _keybd(0x0D)
+    _keybd(0x0D, True)
+    return True
+
+
+def launch_codex_window(marker, env=None, cwd=None):
+    """新开一个控制台窗口运行 codex（Full Access 模式）。
+    先用 title 命令把窗口标题设为 marker，便于后续定位窗口。
+    注意：必须直接用 CREATE_NEW_CONSOLE 开窗口，不能经过
+    `cmd /c start "标题" …`——列表参数被 list2cmdline 加引号后再经 cmd
+    二次解析，start 会把带引号的标题误当成文件名。"""
+    inner = "title " + marker + "&& codex --dangerously-bypass-approvals-and-sandbox"
+    subprocess.Popen(
+        ["cmd", "/k", inner],
+        env=env, cwd=cwd, creationflags=CREATE_NEW_CONSOLE,
+    )
+
+
+CONSOLE_HOST_EXES = ("windowsterminal.exe", "openconsole.exe", "conhost.exe")
+
+
+def _window_exe_name(hwnd) -> str:
+    """返回窗口所属进程的 exe 小写文件名；取不到返回空串。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    pid = wt.DWORD()
+    u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    kh = k.OpenProcess(0x1000, False, pid.value)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not kh:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wt.DWORD(260)
+        if k.QueryFullProcessImageNameW(kh, 0, buf, ctypes.byref(size)):
+            return buf.value.rsplit("\\", 1)[-1].lower()
+        return ""
+    finally:
+        k.CloseHandle(kh)
+
+
+def snapshot_windows() -> set:
+    """当前所有可见顶层窗口句柄集合（用于启动后差分出新窗口）。"""
+    import ctypes
+    u = ctypes.windll.user32
+    Proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    seen = set()
+
+    def cb(hwnd, _lparam):
+        if u.IsWindowVisible(hwnd):
+            seen.add(int(hwnd or 0))
+        return 1
+
+    u.EnumWindows(Proc(cb), None)
+    return seen
+
+
+def find_new_console_window(before, marker, timeout=25, poll=0.25, cancel_event=None):
+    """定位刚打开的 codex 控制台窗口。
+    优先：在 before 快照之后新出现、且属于控制台宿主进程（Windows Terminal /
+    conhost）的顶层窗口——codex TUI 会改写窗口标题，不能依赖标题；
+    其次：标题含 marker 的可见窗口（新标签合并进已有 Windows Terminal 窗口时，
+    窗口标题即焦点标签标题，marker 可见说明我们的标签正处于前台）。
+    超时或取消返回 None。"""
+    import ctypes
+    u = ctypes.windll.user32
+    Proc = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+    def scan():
+        fresh, marked = [], None
+
+        def cb(hwnd, _lparam):
+            h = int(hwnd or 0)
+            if not u.IsWindowVisible(h):
+                return 1
+            if h not in before:
+                fresh.append(h)
+            n = u.GetWindowTextLengthW(h)
+            if n > 0 and marked is None:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(h, buf, n + 1)
+                if marker in buf.value:
+                    marked = h
+            return 1
+
+        u.EnumWindows(Proc(cb), None)
+        return fresh, marked
+
+    t0 = time.time()
+    while True:
+        fresh, marked = scan()
+        for h in fresh:
+            if _window_exe_name(h) in CONSOLE_HOST_EXES:
+                return h
+        if marked is not None:
+            return marked
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        if time.time() - t0 >= timeout:
+            return None
+        time.sleep(poll)
 
 
 # ---------------------------------------------------------------- 后台任务 --
@@ -551,6 +917,82 @@ class Installer:
         self.log("使用方法：打开【新的】PowerShell 或 CMD 窗口，输入 codex 即可启动；"
                  "首次使用前需设置 OPENAI_API_KEY 环境变量。", "ok")
 
+    # ---- Codex 插件修复（v1.2.0）----
+    def run_fix(self):
+        """一键修复 Codex 桌面端插件：
+        ① 设置 Full Access 权限 ② 检测/安装 fast-patch 修复技能
+        ③ 写入 /goal 自定义指令 ④ 打开 codex CLI 并自动输入 /goal 修复指令。"""
+        q = self.q
+        try:
+            self.cancel.clear()
+            self._cancel_noted = False
+
+            self.status("正在检测 Codex CLI …")
+            info = detect()
+            if not (info.get("codex_shim") or shutil.which("codex")):
+                raise RuntimeError(
+                    "未检测到 Codex CLI。请先在上方安装 Codex CLI 后，再使用插件修复。")
+
+            self.set_execution_policy()
+
+            self.status("正在设置 Codex 权限为 Full Access …")
+            ensure_full_access(self.log)
+
+            self.status("正在检查修复技能 …")
+            skill_dir = find_patch_skill()
+            if skill_dir:
+                self.log(f"修复技能已安装：{skill_dir}", "ok")
+            else:
+                self.log("本机未安装修复技能，开始从 GitHub 下载安装 …")
+                install_patch_skill(self.log)
+
+            ensure_goal_prompt(self.log)
+            if _set_clipboard_text(FIX_COMMAND):
+                self.log("修复指令已复制到剪贴板（自动输入未成功时可手动 Ctrl+V）。", "dim")
+
+            marker = "Codex插件修复-" + time.strftime("%H%M%S")
+            self.status("正在打开 Codex CLI 窗口 …")
+            before = snapshot_windows()
+            launch_codex_window(marker, make_env(info.get("node_dir")),
+                                cwd=os.path.expanduser("~"))
+            self.log("Codex CLI 正在新窗口启动（Full Access 模式）。")
+
+            hwnd = find_new_console_window(before, marker, timeout=25,
+                                           cancel_event=self.cancel)
+            if self.cancel.is_set():
+                raise OpCancelled()
+            if not hwnd:
+                raise RuntimeError(
+                    "未找到新打开的 Codex 窗口。请手动打开 PowerShell 运行 codex，"
+                    "修复指令已复制到剪贴板，Ctrl+V 粘贴后回车即可。")
+
+            for s in range(CODEX_BOOT_WAIT_SEC, 0, -1):
+                self.check_cancel()
+                self.status(f"Codex 启动中… {s} 秒后自动输入 /goal 修复指令")
+                time.sleep(1)
+
+            # codex 启动时可能先显示“是否信任当前目录”确认页（1. Yes / 2. No），
+            # 先发一次回车确认（若已直接进入主界面，空的回车不会有任何影响），
+            # 等 TUI 切换完成后再粘贴 /goal 修复指令。
+            if send_enter_to_window(hwnd):
+                self.log("已发送目录信任确认（如出现）。")
+                time.sleep(3)
+            if focus_and_paste(hwnd, FIX_COMMAND):
+                self.log("已自动输入 /goal 修复指令，请在 Codex 窗口中确认执行。", "ok")
+                q.put(("done", True, "插件修复已发起，请查看弹出的 Codex 窗口"))
+            else:
+                self.log("未能自动聚焦 Codex 窗口（可能被系统安全策略拦截）。", "warn")
+                self.log("修复指令已复制到剪贴板：请点击 Codex 窗口，"
+                         "Ctrl+V 粘贴后回车。", "warn")
+                q.put(("done", False, "指令已复制，请手动粘贴到 Codex 窗口"))
+        except OpCancelled:
+            self.log("操作已被用户取消（已打开的 Codex 窗口不受影响）。", "warn")
+            q.put(("done", False, "已取消"))
+        except Exception as e:
+            self.log("发生错误：" + str(e), "err")
+            self.log(traceback.format_exc(limit=3), "err")
+            q.put(("done", False, "失败：" + str(e)))
+
 
 # ---------------------------------------------------------------- GUI -------
 
@@ -573,8 +1015,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title(APP_TITLE + " · " + APP_VENDOR)
-        root.geometry("700x650")
-        root.minsize(640, 590)
+        root.geometry("700x720")
+        root.minsize(640, 660)
         root.configure(bg=BG)
         try:
             ico = res_path("installer.ico")
@@ -706,6 +1148,19 @@ class App:
         tk.Label(card2, text="镜像策略：npmmirror ≥5 分钟未完成 → 自动切换 npm 官方源重试",
                  bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(8, 0))
 
+        # ③ Codex 插件修复卡
+        card_fix = self._card("③ Codex 插件修复（桌面端 Chrome / 浏览器 / Computer Use 失效）")
+        self.btn_fix = tk.Button(card_fix, text="🛠 一键修复 Codex 插件",
+                                 font=("Microsoft YaHei UI", 10, "bold"),
+                                 bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
+                                 activeforeground="white", relief="flat", cursor="hand2",
+                                 disabledforeground="#93C5FD",
+                                 padx=14, pady=7, command=self.on_fix_click)
+        self.btn_fix.pack(fill="x", pady=(6, 6))
+        tk.Label(card_fix, text="自动安装 fast-patch 修复技能 → 设置 Codex 为 Full Access → "
+                             "打开 Codex CLI 并自动输入 /goal 修复指令",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+
         # 进度卡
         card3 = self._card()
         style = ttk.Style()
@@ -737,12 +1192,12 @@ class App:
         card4.pack(fill="both", expand=True, padx=14, pady=(10, 12))
         log_head = tk.Frame(card4, bg=CARD)
         log_head.pack(fill="x")
-        tk.Label(log_head, text="③ 详细日志", bg=CARD, fg=TXT,
+        tk.Label(log_head, text="④ 详细日志", bg=CARD, fg=TXT,
                  font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
         tk.Button(log_head, text="清空日志", font=("Microsoft YaHei UI", 8),
                   bg="#F8FAFC", relief="groove", bd=1, cursor="hand2",
                   command=self._clear_log).pack(side="right")
-        self.txt = tk.Text(card4, height=10, bg=CARD, fg=TXT, font=("Consolas", 9),
+        self.txt = tk.Text(card4, height=9, bg=CARD, fg=TXT, font=("Consolas", 9),
                            wrap="word", relief="flat", state=tk.DISABLED, takefocus=0)
         self.txt.pack(fill="both", expand=True, side="left")
         sb = tk.Scrollbar(card4, command=self.txt.yview)
@@ -755,6 +1210,8 @@ class App:
         self._append_log("欢迎使用 Node.js + Codex CLI 一键安装器。", "ok")
         self._append_log("Node.js 使用内置离线安装包（无需联网）；Codex CLI 通过 npm 联网安装，"
                          "优先 npmmirror 镜像。", "normal")
+        self._append_log("如 Codex 桌面端插件（Chrome / 浏览器 / Computer Use）失效，"
+                         "可使用【③ Codex 插件修复】一键处理。", "normal")
         self._append_log(f"© 2026 {APP_VENDOR} · 本程序仅供个人学习与分享使用", "dim")
 
     def _about(self, event=None):
@@ -795,16 +1252,23 @@ class App:
         if idle:
             self.q.put(("status", "检测完成。点击上方按钮即可开始安装。"))
 
+    def _set_busy(self, busy: bool):
+        """统一切换所有操作按钮的可 用/禁用 状态与进度条。"""
+        self.busy = busy
+        st = tk.DISABLED if busy else "normal"
+        for b in (self.big_btn, self.btn_node_only, self.btn_codex_only, self.btn_fix):
+            b.configure(state=st)
+        self.btn_cancel.configure(state="normal" if busy else tk.DISABLED)
+        if busy:
+            self.bar.start(40)
+        else:
+            self.bar.stop()
+
     def start_task(self, want_node: bool, want_codex: bool):
         if self.busy:
             return
-        self.busy = True
         self._final_shown = False
-        self.big_btn.configure(state=tk.DISABLED)
-        self.btn_node_only.configure(state=tk.DISABLED)
-        self.btn_codex_only.configure(state=tk.DISABLED)
-        self.btn_cancel.configure(state="normal")
-        self.bar.start(40)
+        self._set_busy(True)
         parts = []
         if want_node:
             parts.append("Node.js")
@@ -819,6 +1283,15 @@ class App:
     def on_cancel(self):
         self.worker.cancel.set()
         self._append_log("收到取消请求…", "warn")
+
+    def on_fix_click(self):
+        if self.busy:
+            return
+        self._final_shown = False
+        self._set_busy(True)
+        self._append_log("—— 开始：Codex 插件一键修复 ——", "ok")
+        self.worker_thread = threading.Thread(target=self.worker.run_fix, daemon=True)
+        self.worker_thread.start()
 
     # ---------- 检测结果渲染 ----------
     def render_info(self, info):
@@ -865,12 +1338,7 @@ class App:
                     self.render_info(msg[1])
                 elif kind == "done":
                     _, ok, summary = msg
-                    self.bar.stop()
-                    self.busy = False
-                    self.btn_cancel.configure(state=tk.DISABLED)
-                    self.big_btn.configure(state="normal")
-                    self.btn_node_only.configure(state="normal")
-                    self.btn_codex_only.configure(state="normal")
+                    self._set_busy(False)
                     final = ("✔ 已完成：" if ok else "⚠ 已结束：") + summary
                     self.base_status = final
                     self._final_shown = True

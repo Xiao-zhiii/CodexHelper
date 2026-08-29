@@ -16,6 +16,16 @@
   - 自动执行 `Set-ExecutionPolicy RemoteSigned` 解除 PowerShell“禁止运行脚本”限制
   - 优先走 **npmmirror 国内镜像**，超过 5 分钟自动切换 npm 官方源重试
   - 安装后自动校验版本、定位 `codex` 命令入口
+- **🛠 Codex 插件一键修复（v1.2.0 新增）**：修复 Codex 桌面端
+  Chrome 插件 / 浏览器插件 / Computer Use 插件失效问题
+  - 自动检测本机是否已安装 `codex-windows-fast-patch-skill` 修复技能，
+    没有则从 GitHub 自动下载安装（多源容错）
+  - 自动把 Codex 权限设置为 **Full Access**（`config.toml` 写入
+    `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，原配置自动备份）
+  - 自动写入 `/goal` 自定义指令（`~/.codex/prompts/goal.md`），
+    在 codex 中输入 `/goal` 即可随时调取修复技能
+  - 自动打开 Codex CLI（Full Access 模式），自动确认目录信任提示，
+    并自动输入 `/goal 修复指令`，回车即开始排查修复
 - **管理员模式引导**：启动时检测权限，支持一键 UAC 提权重启
 - **健壮的错误处理**：UAC 取消 / 安装超时 / 双源失败均有明确提示
 
@@ -30,7 +40,7 @@ SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买�
 ## 目录结构
 
 ```
-├── node_codex_installer.py   # 主程序（tkinter GUI + 安装逻辑，约 800 行）
+├── node_codex_installer.py   # 主程序（tkinter GUI + 安装/修复逻辑，约 1100 行）
 ├── make_icon.py              # 图标生成脚本（Pillow）
 ├── installer.ico             # 程序图标
 ├── version_info.txt          # exe 版本资源（版权信息）
@@ -67,6 +77,11 @@ python -m PyInstaller --onefile --windowed --clean --noconfirm \
   执行策略与引号转义问题
 - msiexec 静默安装经 PowerShell `-EncodedCommand` + `Start-Process -Verb RunAs`
   实现，精确解析 msiexec 退出码（0 / 3010 / 1223 / 1602 / 1603 …）
+- 插件修复的窗口自动化：`CREATE_NEW_CONSOLE` 直开控制台（绕开
+  `cmd /c start` 的引号二次解析坑），启动前后窗口快照差分 + 控制台宿主进程
+  过滤定位窗口（codex TUI 会改写窗口标题，不能靠标题找），剪贴板 +
+  `keybd_event` 模拟粘贴回车，仅在前台校验通过后才输入，失败自动回退为
+  “指令已在剪贴板，手动粘贴”
 - 子进程输出经 UTF-8 → GBK 双重解码，兼容中文 Windows
 
 ## 版权声明
