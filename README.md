@@ -1,10 +1,11 @@
-# Node.js + Codex CLI 一键安装器
+# Codex 小帮手（Node.js + Codex CLI 一键安装 · 插件修复）
 
 > © 2026 小枳ai分享 · 作者主页：**https://github.com/Xiao-zhiii**
 
-一个**完全独立**的 Windows 单文件安装工具：自带 Node.js 离线安装包，
-无需 Python / Node.js / 任何运行环境，拷贝到任意 Win10 / Win11 电脑双击即用，
-一键完成 **Node.js + OpenAI Codex CLI** 的安装。
+一个**完全独立**的 Windows 单文件工具：自带 Node.js 离线安装包，
+无需 Python / Node.js / 任何运行环境，拷贝到任意 Win10 / Win11 电脑双击即用。
+一键完成 **Node.js + OpenAI Codex CLI** 的安装，还能**一键修复**
+Codex 桌面端的 Chrome 插件 / 浏览器插件 / Computer Use 插件失效问题。
 
 ## 功能特性
 
@@ -36,7 +37,7 @@
 ## 使用方法
 
 普通用户无需看代码——直接从 [Releases](../../releases) 下载
-`NodeCodex一键安装器.exe`（约 41 MB，单文件），双击运行即可。
+`Codex小帮手.exe`（约 41 MB，单文件），双击运行即可。
 详细图文说明见仓库内《使用说明》或 exe 同目录文档。
 
 SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买数字签名，属正常现象）。

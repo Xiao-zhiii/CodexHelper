@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Node.js + Codex CLI 一键安装器（独立 exe 版）
+Codex 小帮手（独立 exe 版）—— Node.js + Codex CLI 一键安装 · Codex 插件一键修复
 
 版权所有 (C) 2026 小枳ai分享
 本程序由 小枳ai分享 制作并分享，转载/二次分发请保留本版权声明。
@@ -23,9 +23,9 @@ import zipfile
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_CONSOLE = 0x00000010
 
-APP_TITLE = "Node.js + Codex CLI 一键安装器"
+APP_TITLE = "Codex 小帮手"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -1321,9 +1321,9 @@ class App:
                                    font=("Microsoft YaHei UI", 10), anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True)
 
-        self._append_log("欢迎使用 Node.js + Codex CLI 一键安装器。", "ok")
-        self._append_log("Node.js 使用内置离线安装包（无需联网）；Codex CLI 通过 npm 联网安装，"
-                         "优先 npmmirror 镜像。", "normal")
+        self._append_log("欢迎使用 Codex 小帮手！", "ok")
+        self._append_log("一键安装 Node.js（内置离线包，无需联网）与 Codex CLI"
+                         "（npm 联网安装，优先 npmmirror 镜像）。", "normal")
         self._append_log("如 Codex 桌面端插件（Chrome / 浏览器 / Computer Use）失效，"
                          "点击【② 安装 / 修复】中的【一键修复 Codex 插件】一键处理。", "normal")
         self._append_log(f"© 2026 {APP_VENDOR} · 本程序仅供个人学习与分享使用", "dim")
@@ -1331,7 +1331,8 @@ class App:
     def _about(self, event=None):
         messagebox.showinfo(
             "关于本程序",
-            f"Node.js + Codex CLI 一键安装器  v{APP_VERSION}\n\n"
+            f"Codex 小帮手  v{APP_VERSION}\n"
+            f"—— Node.js + Codex CLI 一键安装 · Codex 插件一键修复\n\n"
             f"© 2026 {APP_VENDOR} · 版权所有\n"
             f"作者主页：{_wm()}\n\n"
             f"本程序由 {APP_VENDOR} 制作并分享，仅供个人学习使用，\n"
