@@ -16,7 +16,7 @@
   - 自动执行 `Set-ExecutionPolicy RemoteSigned` 解除 PowerShell“禁止运行脚本”限制
   - 优先走 **npmmirror 国内镜像**，超过 5 分钟自动切换 npm 官方源重试
   - 安装后自动校验版本、定位 `codex` 命令入口
-- **🛠 Codex 插件一键修复（v1.2.0 新增）**：修复 Codex 桌面端
+- **🛠 Codex 插件一键修复（v1.2 新增）**：修复 Codex 桌面端
   Chrome 插件 / 浏览器插件 / Computer Use 插件失效问题
   - 自动检测本机是否已安装 `codex-windows-fast-patch-skill` 修复技能，
     没有则从 GitHub 自动下载安装（多源容错）
@@ -24,8 +24,10 @@
     `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，原配置自动备份）
   - 自动写入 `/goal` 自定义指令（`~/.codex/prompts/goal.md`），
     在 codex 中输入 `/goal` 即可随时调取修复技能
-  - 自动打开 Codex CLI（Full Access 模式），自动确认目录信任提示，
+  - 自动打开 **PowerShell 版 Codex CLI**（Full Access 模式），自动确认目录信任提示，
     并自动输入 `/goal 修复指令`，回车即开始排查修复
+  - 自动输入未成功时（个别 Win10 环境安全策略拦截），自动弹窗提示：
+    修复提示词已在剪贴板，点击 Codex 窗口【鼠标右键】即可粘贴（或 Ctrl+V），回车开始修复
 - **管理员模式引导**：启动时检测权限，支持一键 UAC 提权重启
 - **健壮的错误处理**：UAC 取消 / 安装超时 / 双源失败均有明确提示
 

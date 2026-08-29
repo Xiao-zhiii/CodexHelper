@@ -25,7 +25,7 @@ CREATE_NEW_CONSOLE = 0x00000010
 
 APP_TITLE = "Node.js + Codex CLI 一键安装器"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -463,20 +463,44 @@ def _keybd(vk, up=False):
 
 
 def focus_window(hwnd) -> bool:
-    """把窗口带到前台；成功返回 True。"""
+    """把窗口带到前台；成功返回 True。
+    先用 ALT 敲击解除前台锁；不行再 AttachThreadInput 挂到前台线程的
+    输入队列后强制切换（Win10 上对 SetForegroundWindow 的限制更严）。"""
     import ctypes
     u = ctypes.windll.user32
+    k = ctypes.windll.kernel32
     u.GetForegroundWindow.restype = ctypes.c_void_p
     hwnd = int(hwnd)
-    for _ in range(3):
+
+    def is_fg():
+        return int(u.GetForegroundWindow() or 0) == hwnd
+
+    for _ in range(2):
         u.ShowWindow(hwnd, 9)              # SW_RESTORE
         _keybd(0x12)
         _keybd(0x12, True)                 # 轻敲 ALT 解除前台切换限制
         u.SetForegroundWindow(hwnd)
-        time.sleep(0.5)
-        if int(u.GetForegroundWindow() or 0) == hwnd:
+        time.sleep(0.45)
+        if is_fg():
             return True
-    return int(u.GetForegroundWindow() or 0) == hwnd
+
+    fg = int(u.GetForegroundWindow() or 0)
+    if fg:
+        fg_thread = u.GetWindowThreadProcessId(fg, None)
+        cur = k.GetCurrentThreadId()
+        u.AttachThreadInput(cur, fg_thread, True)
+        try:
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+        finally:
+            u.AttachThreadInput(cur, fg_thread, False)
+        time.sleep(0.45)
+        if is_fg():
+            return True
+
+    u.SetForegroundWindow(hwnd)
+    time.sleep(0.4)
+    return is_fg()
 
 
 def focus_and_paste(hwnd, text) -> bool:
@@ -511,14 +535,18 @@ def send_enter_to_window(hwnd) -> bool:
 
 
 def launch_codex_window(marker, env=None, cwd=None):
-    """新开一个控制台窗口运行 codex（Full Access 模式）。
-    先用 title 命令把窗口标题设为 marker，便于后续定位窗口。
+    """新开一个 PowerShell 窗口运行 codex（Full Access 模式）。
+    先用 $host.UI.RawUI.WindowTitle 把窗口标题设为 marker，便于按标题定位。
     注意：必须直接用 CREATE_NEW_CONSOLE 开窗口，不能经过
     `cmd /c start "标题" …`——列表参数被 list2cmdline 加引号后再经 cmd
-    二次解析，start 会把带引号的标题误当成文件名。"""
-    inner = "title " + marker + "&& codex --dangerously-bypass-approvals-and-sandbox"
+    二次解析，start 会把带引号的标题误当成文件名。
+    -NoExit：codex 退出后窗口保留，便于查看报错；
+    -NoProfile -ExecutionPolicy Bypass：不受用户配置与执行策略影响。"""
+    ps_cmd = ("$host.UI.RawUI.WindowTitle='" + marker + "'; "
+              "codex --dangerously-bypass-approvals-and-sandbox")
     subprocess.Popen(
-        ["cmd", "/k", inner],
+        ["powershell", "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-Command", ps_cmd],
         env=env, cwd=cwd, creationflags=CREATE_NEW_CONSOLE,
     )
 
@@ -579,6 +607,7 @@ def find_new_console_window(before, marker, timeout=25, poll=0.25, cancel_event=
         fresh, marked = [], None
 
         def cb(hwnd, _lparam):
+            nonlocal marked   # 回调内重新绑定外层变量，必须声明，否则 EnumWindows 会被异常中断
             h = int(hwnd or 0)
             if not u.IsWindowVisible(h):
                 return 1
@@ -948,14 +977,15 @@ class Installer:
 
             ensure_goal_prompt(self.log)
             if _set_clipboard_text(FIX_COMMAND):
-                self.log("修复指令已复制到剪贴板（自动输入未成功时可手动 Ctrl+V）。", "dim")
+                self.log("修复提示词已复制到剪贴板（自动输入未成功时，"
+                         "在 Codex 窗口内【鼠标右键】即可粘贴）。", "dim")
 
             marker = "Codex插件修复-" + time.strftime("%H%M%S")
             self.status("正在打开 Codex CLI 窗口 …")
             before = snapshot_windows()
             launch_codex_window(marker, make_env(info.get("node_dir")),
                                 cwd=os.path.expanduser("~"))
-            self.log("Codex CLI 正在新窗口启动（Full Access 模式）。")
+            self.log("Codex CLI 正在新 PowerShell 窗口启动（Full Access 模式）。")
 
             hwnd = find_new_console_window(before, marker, timeout=25,
                                            cancel_event=self.cancel)
@@ -963,8 +993,9 @@ class Installer:
                 raise OpCancelled()
             if not hwnd:
                 raise RuntimeError(
-                    "未找到新打开的 Codex 窗口。请手动打开 PowerShell 运行 codex，"
-                    "修复指令已复制到剪贴板，Ctrl+V 粘贴后回车即可。")
+                    "未找到新打开的 Codex 窗口。请手动打开 PowerShell 输入 codex；"
+                    "修复提示词已复制到剪贴板，在窗口内【鼠标右键】即可粘贴，"
+                    "回车开始修复。")
 
             for s in range(CODEX_BOOT_WAIT_SEC, 0, -1):
                 self.check_cancel()
@@ -979,12 +1010,16 @@ class Installer:
                 time.sleep(3)
             if focus_and_paste(hwnd, FIX_COMMAND):
                 self.log("已自动输入 /goal 修复指令，请在 Codex 窗口中确认执行。", "ok")
+                self.log("若窗口内未出现输入内容：修复提示词已复制到剪贴板，"
+                         "点击该窗口【鼠标右键】即可粘贴（或 Ctrl+V），回车开始修复。",
+                         "dim")
                 q.put(("done", True, "插件修复已发起，请查看弹出的 Codex 窗口"))
             else:
-                self.log("未能自动聚焦 Codex 窗口（可能被系统安全策略拦截）。", "warn")
-                self.log("修复指令已复制到剪贴板：请点击 Codex 窗口，"
-                         "Ctrl+V 粘贴后回车。", "warn")
-                q.put(("done", False, "指令已复制，请手动粘贴到 Codex 窗口"))
+                self.log("自动输入未成功。修复提示词已复制到剪贴板。", "warn")
+                self.log("请点击刚打开的 Codex（PowerShell）窗口 → 【鼠标右键】即可粘贴"
+                         "（或按 Ctrl+V）→ 按回车开始修复。", "warn")
+                q.put(("fix_manual", None))
+                q.put(("done", False, "提示词已复制，请到 Codex 窗口右键粘贴并回车"))
         except OpCancelled:
             self.log("操作已被用户取消（已打开的 Codex 窗口不受影响）。", "warn")
             q.put(("done", False, "已取消"))
@@ -1015,8 +1050,12 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title(APP_TITLE + " · " + APP_VENDOR)
-        root.geometry("700x720")
-        root.minsize(640, 660)
+        # 窗口高度自适应屏幕：小屏幕（如 1366x768 的 Win10 笔记本）不超屏，
+        # 保证底部日志区完整可见
+        scr_h = root.winfo_screenheight()
+        win_h = max(520, min(650, scr_h - 150))
+        root.geometry(f"700x{win_h}")
+        root.minsize(640, 520)
         root.configure(bg=BG)
         try:
             ico = res_path("installer.ico")
@@ -1079,6 +1118,35 @@ class App:
         return c
 
     def _build_ui(self):
+        # 页脚与日志卡最先布局（side=bottom 优先占位）：窗口高度不足时，
+        # 上方卡片自动被压缩，日志区始终完整可见。
+        foot = tk.Label(self.root, text=f"© 2026 {APP_VENDOR} · 点击查看关于",
+                        bg=BG, fg=SUB, font=("Microsoft YaHei UI", 8),
+                        cursor="hand2")
+        foot.pack(side="bottom", pady=(2, 4))
+        foot.bind("<Button-1>", self._about)
+
+        # ③ 日志卡
+        card4 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, padx=10, pady=6)
+        card4.pack(side="bottom", fill="both", expand=True, padx=14, pady=(8, 0))
+        log_head = tk.Frame(card4, bg=CARD)
+        log_head.pack(fill="x")
+        tk.Label(log_head, text="③ 详细日志", bg=CARD, fg=TXT,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        tk.Button(log_head, text="清空日志", font=("Microsoft YaHei UI", 8),
+                  bg="#F8FAFC", relief="groove", bd=1, cursor="hand2",
+                  command=self._clear_log).pack(side="right")
+        self.txt = tk.Text(card4, height=6, bg=CARD, fg=TXT, font=("Consolas", 9),
+                           wrap="word", relief="flat", state=tk.DISABLED, takefocus=0)
+        self.txt.pack(fill="both", expand=True, side="left")
+        sb = tk.Scrollbar(card4, command=self.txt.yview)
+        sb.pack(side="right", fill="y")
+        self.txt.configure(yscrollcommand=sb.set)
+        for tag, color in [("ok", GREEN_FG), ("warn", AMBER_FG), ("err", "#DC2626"),
+                           ("dim", SUB), ("normal", TXT)]:
+            self.txt.tag_configure(tag, foreground=color)
+
         head = tk.Frame(self.root, bg=BG)
         head.pack(fill="x", pady=(12, 0), padx=4)
         tk.Label(head, text=APP_TITLE, bg=BG, fg=TXT,
@@ -1116,8 +1184,8 @@ class App:
                                 bd=1, padx=10, cursor="hand2")
         btn_recheck.pack(anchor="ne", side="bottom")
 
-        # ② 操作卡
-        card2 = self._card("② 开始安装")
+        # ② 安装 / 修复卡
+        card2 = self._card("② 安装 / 修复")
         self.big_btn = tk.Button(card2, text="一键安装 Node.js 和 Codex CLI",
                                  font=("Microsoft YaHei UI", 11, "bold"),
                                  bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
@@ -1145,20 +1213,21 @@ class App:
         self.btn_node_only.pack(side="left")
         self.btn_codex_only.pack(side="left", padx=8)
         self.btn_cancel.pack(side="right")
-        tk.Label(card2, text="镜像策略：npmmirror ≥5 分钟未完成 → 自动切换 npm 官方源重试",
-                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(8, 0))
 
-        # ③ Codex 插件修复卡
-        card_fix = self._card("③ Codex 插件修复（桌面端 Chrome / 浏览器 / Computer Use 失效）")
-        self.btn_fix = tk.Button(card_fix, text="🛠 一键修复 Codex 插件",
-                                 font=("Microsoft YaHei UI", 10, "bold"),
-                                 bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
-                                 activeforeground="white", relief="flat", cursor="hand2",
-                                 disabledforeground="#93C5FD",
-                                 padx=14, pady=7, command=self.on_fix_click)
-        self.btn_fix.pack(fill="x", pady=(6, 6))
-        tk.Label(card_fix, text="自动安装 fast-patch 修复技能 → 设置 Codex 为 Full Access → "
-                             "打开 Codex CLI 并自动输入 /goal 修复指令",
+        # 一键修复 Codex 插件（与安装同卡，节省纵向空间）
+        self.btn_fix = tk.Button(card2, text="🛠 一键修复 Codex 插件"
+                                 "（桌面端 Chrome / 浏览器 / Computer Use 插件失效）",
+                                 font=("Microsoft YaHei UI", 9, "bold"),
+                                 bg="#EFF6FF", fg=PRIMARY_D,
+                                 activebackground="#DBEAFE", activeforeground=PRIMARY_D,
+                                 relief="groove", bd=1, disabledforeground="#93C5FD",
+                                 cursor="hand2", padx=10, pady=6,
+                                 command=self.on_fix_click)
+        self.btn_fix.pack(fill="x", pady=(8, 0))
+        tk.Label(card2, text="修复流程：自动安装 fast-patch 技能 → 设为 Full Access → "
+                          "打开 PowerShell 版 Codex 并自动输入 /goal 修复指令",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(4, 0))
+        tk.Label(card2, text="镜像策略：npmmirror ≥5 分钟未完成 → 自动切换 npm 官方源重试",
                  bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
         # 进度卡
@@ -1179,39 +1248,11 @@ class App:
                                    font=("Microsoft YaHei UI", 10), anchor="w")
         self.lbl_status.pack(side="left", fill="x", expand=True)
 
-        # 版权页脚（点击查看关于）
-        foot = tk.Label(self.root, text=f"© 2026 {APP_VENDOR}",
-                        bg=BG, fg=SUB, font=("Microsoft YaHei UI", 8),
-                        cursor="hand2")
-        foot.pack(side="bottom", pady=(2, 5))
-        foot.bind("<Button-1>", self._about)
-
-        # ③ 日志卡
-        card4 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
-                         highlightthickness=1, padx=10, pady=8)
-        card4.pack(fill="both", expand=True, padx=14, pady=(10, 12))
-        log_head = tk.Frame(card4, bg=CARD)
-        log_head.pack(fill="x")
-        tk.Label(log_head, text="④ 详细日志", bg=CARD, fg=TXT,
-                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        tk.Button(log_head, text="清空日志", font=("Microsoft YaHei UI", 8),
-                  bg="#F8FAFC", relief="groove", bd=1, cursor="hand2",
-                  command=self._clear_log).pack(side="right")
-        self.txt = tk.Text(card4, height=9, bg=CARD, fg=TXT, font=("Consolas", 9),
-                           wrap="word", relief="flat", state=tk.DISABLED, takefocus=0)
-        self.txt.pack(fill="both", expand=True, side="left")
-        sb = tk.Scrollbar(card4, command=self.txt.yview)
-        sb.pack(side="right", fill="y")
-        self.txt.configure(yscrollcommand=sb.set)
-        for tag, color in [("ok", GREEN_FG), ("warn", AMBER_FG), ("err", "#DC2626"),
-                           ("dim", SUB), ("normal", TXT)]:
-            self.txt.tag_configure(tag, foreground=color)
-
         self._append_log("欢迎使用 Node.js + Codex CLI 一键安装器。", "ok")
         self._append_log("Node.js 使用内置离线安装包（无需联网）；Codex CLI 通过 npm 联网安装，"
                          "优先 npmmirror 镜像。", "normal")
         self._append_log("如 Codex 桌面端插件（Chrome / 浏览器 / Computer Use）失效，"
-                         "可使用【③ Codex 插件修复】一键处理。", "normal")
+                         "点击【② 安装 / 修复】中的【一键修复 Codex 插件】一键处理。", "normal")
         self._append_log(f"© 2026 {APP_VENDOR} · 本程序仅供个人学习与分享使用", "dim")
 
     def _about(self, event=None):
@@ -1336,6 +1377,18 @@ class App:
                         self.lbl_status.configure(text=f"{lbl}（已进行 {msg[1]} 秒）")
                 elif kind == "info":
                     self.render_info(msg[1])
+                elif kind == "fix_manual":
+                    try:
+                        messagebox.showinfo(
+                            "已复制修复提示词到剪贴板",
+                            "未能自动输入修复指令（可能被系统安全策略拦截）。\n\n"
+                            "修复提示词已复制到剪贴板：\n"
+                            "① 点击刚打开的 Codex（PowerShell）窗口；\n"
+                            "② 在窗口内【鼠标右键】即可粘贴（或按 Ctrl+V）；\n"
+                            "③ 按回车开始修复。",
+                            parent=self.root)
+                    except Exception:
+                        pass
                 elif kind == "done":
                     _, ok, summary = msg
                     self._set_busy(False)

@@ -38,12 +38,13 @@ Computer Use（电脑操作）插件无法使用、按钮变灰或功能消失�
    config.toml.nodecodexsetup.bak）；
 3. 写入 /goal 自定义指令（~/.codex/prompts/goal.md），
    之后你在 codex 里随时输入 /goal 也能调取修复技能；
-4. 自动打开一个新的 Codex CLI 窗口（Full Access 模式），
+4. 自动打开一个新的 PowerShell 窗口运行 Codex CLI（Full Access 模式），
    自动确认“目录信任”提示，并自动输入修复指令开始排查修复。
 注意：
 · 需要先安装好 Codex CLI（可用本工具先安装）；
-· 自动输入被系统拦截时，修复指令已复制到剪贴板，
-  手动到 Codex 窗口按 Ctrl+V 回车即可；
+· 若自动输入未成功（个别 Win10 环境会被安全策略拦截），程序会弹窗提醒：
+  修复提示词已复制到剪贴板 —— 点击刚打开的 Codex（PowerShell）窗口，
+  【鼠标右键】即可粘贴（或按 Ctrl+V），然后按回车开始修复；
 · 修复过程由 Codex 自主执行，请在其窗口内确认与观察。
 
 【Codex CLI 首次使用】
@@ -82,7 +83,7 @@ Computer Use（电脑操作）插件无法使用、按钮变灰或功能消失�
       --add-data "installer.ico;assets" \
       node_codex_installer.py
 
-生成日期：2026-08-29（v1.2.0）
+生成日期：2026-08-29（v1.2.1）
 
 ═══════════════════════════════════════════════════════
  版权与声明
