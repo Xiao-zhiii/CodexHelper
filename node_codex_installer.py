@@ -25,7 +25,7 @@ CREATE_NEW_CONSOLE = 0x00000010
 
 APP_TITLE = "Node.js + Codex CLI 一键安装器"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -534,6 +534,74 @@ def send_enter_to_window(hwnd) -> bool:
     return True
 
 
+# ---- SendInput 逐字符键入（不依赖剪贴板 / Ctrl+V）----
+# 原因：codex TUI 把 Ctrl+V 绑定为“粘贴剪贴板图片”，剪贴板里是文字时
+# 会报 “no image on clipboard” 且文本不会输入；而 Win10 的传统控制台
+# 不会像 Windows Terminal 那样拦截 Ctrl+V 转成文本粘贴。
+# 逐字符发送 KEYEVENTF_UNICODE 等效人工打字，两种控制台都适用。
+import ctypes
+
+_KEYBOARD = 1                # INPUT_KEYBOARD
+_KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_KEYUP = 0x0002
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_ulong), ("union", _INPUTUNION)]
+
+
+def _send_unicode_char(ch) -> bool:
+    """发送一个 Unicode 字符的按下+抬起事件（中文等 BMP 字符均支持）。"""
+    import ctypes
+    u = ctypes.windll.user32
+    code = ord(ch)
+    if code > 0xFFFF:
+        return False
+    down = _INPUT()
+    down.type = _KEYBOARD
+    down.union.ki = _KEYBDINPUT(0, code, _KEYEVENTF_UNICODE, 0, None)
+    up = _INPUT()
+    up.type = _KEYBOARD
+    up.union.ki = _KEYBDINPUT(0, code,
+                              _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP, 0, None)
+    sent = u.SendInput(1, ctypes.byref(down), ctypes.sizeof(_INPUT))
+    sent += u.SendInput(1, ctypes.byref(up), ctypes.sizeof(_INPUT))
+    return sent == 2
+
+
+def type_text_into_window(hwnd, text, char_delay=0.012) -> bool:
+    """把窗口带到前台后逐字符键入 text 并回车。
+    仅在确认目标窗口已在前台时才输入，避免打字打到别的窗口。"""
+    if not focus_window(hwnd):
+        return False
+    time.sleep(0.3)
+    for ch in text:
+        if not _send_unicode_char(ch):
+            return False
+        time.sleep(char_delay)
+    time.sleep(0.3)
+    _keybd(0x0D)
+    _keybd(0x0D, True)                     # 回车提交
+    return True
+
+
 def launch_codex_window(marker, env=None, cwd=None):
     """新开一个 PowerShell 窗口运行 codex（Full Access 模式）。
     先用 $host.UI.RawUI.WindowTitle 把窗口标题设为 marker，便于按标题定位。
@@ -1004,20 +1072,25 @@ class Installer:
 
             # codex 启动时可能先显示“是否信任当前目录”确认页（1. Yes / 2. No），
             # 先发一次回车确认（若已直接进入主界面，空的回车不会有任何影响），
-            # 等 TUI 切换完成后再粘贴 /goal 修复指令。
+            # 等 TUI 切换完成后再键入 /goal 修复指令。
             if send_enter_to_window(hwnd):
                 self.log("已发送目录信任确认（如出现）。")
                 time.sleep(3)
-            if focus_and_paste(hwnd, FIX_COMMAND):
-                self.log("已自动输入 /goal 修复指令，请在 Codex 窗口中确认执行。", "ok")
+            # 不用 Ctrl+V：codex TUI 把 Ctrl+V 绑定为“粘贴剪贴板图片”，
+            # 会报 “no image on clipboard” 且文本进不去（Win10 传统控制台尤甚）。
+            # 改为逐字符键入，等效人工打字，两种控制台都适用。
+            if type_text_into_window(hwnd, FIX_COMMAND):
+                self.log("已自动键入 /goal 修复指令并回车，请在 Codex 窗口中确认执行。",
+                         "ok")
                 self.log("若窗口内未出现输入内容：修复提示词已复制到剪贴板，"
-                         "点击该窗口【鼠标右键】即可粘贴（或 Ctrl+V），回车开始修复。",
-                         "dim")
+                         "点击该窗口【鼠标右键】即可粘贴（注意不要按 Ctrl+V，"
+                         "codex 会把它当作粘贴图片），回车开始修复。", "dim")
                 q.put(("done", True, "插件修复已发起，请查看弹出的 Codex 窗口"))
             else:
                 self.log("自动输入未成功。修复提示词已复制到剪贴板。", "warn")
                 self.log("请点击刚打开的 Codex（PowerShell）窗口 → 【鼠标右键】即可粘贴"
-                         "（或按 Ctrl+V）→ 按回车开始修复。", "warn")
+                         "→ 按回车开始修复（注意：不要按 Ctrl+V，codex 会把它"
+                         "当作粘贴图片）。", "warn")
                 q.put(("fix_manual", None))
                 q.put(("done", False, "提示词已复制，请到 Codex 窗口右键粘贴并回车"))
         except OpCancelled:
@@ -1381,10 +1454,11 @@ class App:
                     try:
                         messagebox.showinfo(
                             "已复制修复提示词到剪贴板",
-                            "未能自动输入修复指令（可能被系统安全策略拦截）。\n\n"
+                            "未能自动键入修复指令（可能被系统安全策略拦截）。\n\n"
                             "修复提示词已复制到剪贴板：\n"
                             "① 点击刚打开的 Codex（PowerShell）窗口；\n"
-                            "② 在窗口内【鼠标右键】即可粘贴（或按 Ctrl+V）；\n"
+                            "② 在窗口内【鼠标右键】即可粘贴\n"
+                            "（注意：不要按 Ctrl+V，codex 会把它当作粘贴图片）；\n"
                             "③ 按回车开始修复。",
                             parent=self.root)
                     except Exception:
