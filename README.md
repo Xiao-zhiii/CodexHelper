@@ -37,7 +37,7 @@ Codex 桌面端的 Chrome 插件 / 浏览器插件 / Computer Use 插件失效�
 ## 使用方法
 
 普通用户无需看代码——直接从 [Releases](../../releases) 下载
-`Codex小帮手.exe`（约 41 MB，单文件），双击运行即可。
+`CodexHelper.exe`（约 41 MB，单文件，即「Codex 小帮手」），双击运行即可。
 详细图文说明见仓库内《使用说明》或 exe 同目录文档。
 
 SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买数字签名，属正常现象）。
