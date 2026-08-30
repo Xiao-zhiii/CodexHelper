@@ -31,6 +31,11 @@ Codex 桌面端的 Chrome 插件 / 浏览器插件 / Computer Use 插件失效�
     传统控制台下文字无法输入（报 no image on clipboard）
   - 自动输入未成功时（个别环境安全策略拦截），自动弹窗提示：
     修复提示词已在剪贴板，点击 Codex 窗口【鼠标右键】即可粘贴，回车开始修复
+- **🗨 ChatGPT 启动修复（v1.4.0 新增，独立分页）**：修复 ChatGPT 桌面应用
+  启动报错 "ChatGPT failed to start. Unable to locate the Codex CLI binary"
+  - 自动检测 OpenAI.Codex 桌面应用（ChatGPT）安装状态与包内 codex.exe 位置
+  - 一键写入用户环境变量 `CODEX_CLI_PATH` 并自动重启 ChatGPT 应用
+    （包内找不到 CLI 时自动回退到 npm 版 Codex 的原生二进制）
 - **管理员模式引导**：启动时检测权限，支持一键 UAC 提权重启
 - **健壮的错误处理**：UAC 取消 / 安装超时 / 双源失败均有明确提示
 

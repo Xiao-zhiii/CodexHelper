@@ -6,6 +6,7 @@ Codex 小帮手（独立 exe 版）—— Node.js + Codex CLI 一键安装 · Co
 本程序由 小枳ai分享 制作并分享，转载/二次分发请保留本版权声明。
 """
 import base64
+import glob
 import io
 import json
 import os
@@ -25,7 +26,7 @@ CREATE_NEW_CONSOLE = 0x00000010
 
 APP_TITLE = "Codex 小帮手"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -707,6 +708,124 @@ def find_new_console_window(before, marker, timeout=25, poll=0.25, cancel_event=
         time.sleep(poll)
 
 
+# ------------------------------------------- ChatGPT 启动修复（v1.4.0）--
+# 报错：ChatGPT failed to start. Unable to locate the Codex CLI binary.
+#       Set CODEX_CLI PATH or ensure the Electron resources include bin/codex.
+# 修复原理（教程 repair.ps1）：定位 OpenAI.Codex 桌面应用（ChatGPT）包内的
+# codex.exe，写入用户环境变量 CODEX_CLI_PATH，然后重启 ChatGPT 应用。
+
+GPT_ERROR_TEXT = ("ChatGPT failed to start. Unable to locate the Codex CLI binary.\n"
+                  "Set CODEX_CLI_PATH or ensure the Electron resources include bin/codex.")
+
+
+def _ps_json_out(ps_cmd, timeout=90):
+    """静默执行 PowerShell 命令并返回 stdout 文本；失败返回空串。"""
+    ps_exe = shutil.which("powershell") or "powershell"
+    try:
+        p = subprocess.run([ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-Command", ps_cmd], capture_output=True,
+                           timeout=timeout, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        return ""
+    return decode_bytes(p.stdout).strip()
+
+
+def find_codex_desktop(log=print):
+    """检测 OpenAI.Codex 桌面应用（ChatGPT）安装包（取最新版本）。
+    返回 dict（name/version/location/family）；未安装返回 None。"""
+    out = _ps_json_out(
+        "Get-AppxPackage -Name 'OpenAI.Codex' | "
+        "Sort-Object Version -Descending | Select-Object -First 1 | "
+        "ConvertTo-Json")
+    if not out:
+        return None
+    try:
+        pkg = json.loads(out)
+        if isinstance(pkg, list):
+            pkg = pkg[0] if pkg else None
+        if not pkg or not pkg.get("InstallLocation"):
+            return None
+        return {"name": pkg.get("Name"),
+                "version": pkg.get("Version"),
+                "location": pkg.get("InstallLocation"),
+                "family": pkg.get("PackageFamilyName")}
+    except Exception as e:
+        log(f"解析 OpenAI.Codex 桌面包信息失败：{e}", "warn")
+        return None
+
+
+def locate_codex_cli(location):
+    """定位 codex CLI 二进制：先按教程 repair.ps1 的候选顺序在桌面包内找；
+    包内没有时回退到 npm 版 Codex CLI 的原生 codex.exe。"""
+    candidates = [os.path.join(location, "app", "resources", "codex.exe"),
+                  os.path.join(location, "app", "bin", "codex.exe"),
+                  os.path.join(location, "app", "Codex.exe")]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    appdata = os.environ.get("APPDATA", "")
+    for p in glob.glob(os.path.join(
+            appdata, "npm", "node_modules", "@openai", "codex-win32-*",
+            "vendor", "*", "bin", "codex.exe")):
+        return p
+    return None
+
+
+def get_user_env(name) -> str:
+    """读取用户环境变量（直接查注册表 HKCU\\Environment，无需重启验证）。"""
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment")
+        v, _ = winreg.QueryValueEx(k, name)
+        winreg.CloseKey(k)
+        return v
+    except Exception:
+        return ""
+
+
+def set_user_env(name, value, log=print) -> bool:
+    """写入用户环境变量。PowerShell 的 SetEnvironmentVariable 会广播
+    WM_SETTINGCHANGE，之后新启动的应用立即可见，无需注销或重启电脑。"""
+    ps_cmd = ("[Environment]::SetEnvironmentVariable('%s', '%s', 'User')"
+              % (name, str(value).replace("'", "''")))
+    enc = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
+    ps_exe = shutil.which("powershell") or "powershell"
+    rc, out = run_quiet([ps_exe, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                         "-EncodedCommand", enc], timeout=60)
+    if rc != 0:
+        log(f"写入环境变量失败（退出码 {rc}）：{out[:200]}", "warn")
+        return False
+    return get_user_env(name) == value
+
+
+def restart_chatgpt_app(log=print) -> bool:
+    """关闭 ChatGPT 应用并重新启动（explorer shell:AppsFolder\\<family>!App）。"""
+    subprocess.run(["taskkill", "/IM", "ChatGPT.exe", "/T", "/F"],
+                   capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=20)
+    time.sleep(2)
+    pkg = find_codex_desktop(log=log)
+    if not pkg or not pkg.get("family"):
+        log("未找到 OpenAI.Codex 桌面包，无法自动重启 ChatGPT 应用。", "warn")
+        return False
+    try:
+        subprocess.Popen(["explorer.exe",
+                          "shell:AppsFolder\\" + pkg["family"] + "!App"])
+        return True
+    except Exception as e:
+        log("重启 ChatGPT 应用失败：" + str(e), "warn")
+        return False
+
+
+def detect_gpt_env():
+    """【ChatGPT 启动修复】分页的环境检测结果。"""
+    info = {"pkg": None, "cli": None, "env": get_user_env("CODEX_CLI_PATH")}
+    pkg = find_codex_desktop(log=lambda *a, **k: None)
+    info["pkg"] = pkg
+    if pkg and pkg.get("location"):
+        info["cli"] = locate_codex_cli(pkg["location"])
+    return info
+
+
 # ---------------------------------------------------------------- 后台任务 --
 
 class Installer:
@@ -1101,6 +1220,61 @@ class Installer:
             self.log(traceback.format_exc(limit=3), "err")
             q.put(("done", False, "失败：" + str(e)))
 
+    # ---- ChatGPT 启动修复（v1.4.0）----
+    def run_fix_gpt(self, restart=True):
+        """修复 ChatGPT 桌面应用启动报错：
+        定位 OpenAI.Codex 桌面包内的 codex.exe → 写入用户环境变量
+        CODEX_CLI_PATH → 重启 ChatGPT 应用。"""
+        q = self.q
+        try:
+            self.cancel.clear()
+            self._cancel_noted = False
+
+            self.status("正在检测 OpenAI.Codex 桌面应用 …")
+            pkg = find_codex_desktop(self.log)
+            if not pkg:
+                raise RuntimeError(
+                    "本机未安装 OpenAI.Codex 桌面应用（ChatGPT）。"
+                    "请先从 Microsoft Store 安装后再使用本修复。")
+            self.log(f"已找到 ChatGPT 桌面应用：v{pkg['version']}", "ok")
+            self.log(f"安装位置：{pkg['location']}")
+
+            self.status("正在定位 codex CLI 二进制 …")
+            cli = locate_codex_cli(pkg["location"])
+            if not cli:
+                raise RuntimeError(
+                    "桌面包内与 npm 全局包中均未找到 codex.exe。"
+                    "请先在本工具【安装 · 插件修复】页安装 Codex CLI 后重试。")
+            self.log(f"Codex CLI 二进制：{cli}", "ok")
+
+            self.status("正在写入 CODEX_CLI_PATH 环境变量 …")
+            if not set_user_env("CODEX_CLI_PATH", cli, self.log):
+                raise RuntimeError(
+                    "写入用户环境变量 CODEX_CLI_PATH 失败，请以管理员身份运行本工具后重试。")
+            self.log("已写入用户环境变量：CODEX_CLI_PATH = " + cli, "ok")
+
+            q.put(("gpt_info", detect_gpt_env()))
+
+            if restart:
+                self.status("正在重启 ChatGPT 应用 …")
+                if restart_chatgpt_app(self.log):
+                    self.log("ChatGPT 应用已重启，请查看是否正常启动。", "ok")
+                else:
+                    self.log("请手动完全关闭并重新打开 ChatGPT 应用，修复即可生效。",
+                             "warn")
+            else:
+                self.log("修复完成。请完全关闭并重新打开 ChatGPT 应用。", "ok")
+
+            q.put(("done", True, "ChatGPT 启动修复完成"
+                   + ("，应用已重启" if restart else "")))
+        except OpCancelled:
+            self.log("操作已被用户取消。", "warn")
+            q.put(("done", False, "已取消"))
+        except Exception as e:
+            self.log("发生错误：" + str(e), "err")
+            self.log(traceback.format_exc(limit=3), "err")
+            q.put(("done", False, "失败：" + str(e)))
+
 
 # ---------------------------------------------------------------- GUI -------
 
@@ -1181,8 +1355,8 @@ class App:
                          "warn")
 
     # ---------- UI 构建 ----------
-    def _card(self, title=None):
-        c = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+    def _card(self, title=None, parent=None):
+        c = tk.Frame(parent or self.root, bg=CARD, highlightbackground=BORDER,
                      highlightthickness=1, padx=14, pady=10)
         c.pack(fill="x", padx=14, pady=(10, 0))
         if title:
@@ -1220,6 +1394,29 @@ class App:
                            ("dim", SUB), ("normal", TXT)]:
             self.txt.tag_configure(tag, foreground=color)
 
+        # 状态/进度条（底部固定条，两个分页共用）
+        card3 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, padx=14, pady=8)
+        card3.pack(side="bottom", fill="x", padx=14, pady=(8, 8))
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Installer.Horizontal.TProgressbar", thickness=8,
+                        background=PRIMARY, troughcolor="#E2E8F0", borderwidth=0)
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"),
+                        padding=(16, 6))
+        self.bar = ttk.Progressbar(card3, mode="indeterminate", maximum=24,
+                                   style="Installer.Horizontal.TProgressbar")
+        self.bar.pack(fill="x", pady=(2, 6))
+        row3 = tk.Frame(card3, bg=CARD)
+        row3.pack(fill="x")
+        self.lbl_status = tk.Label(row3, text="就绪。正在检测本机环境…", bg=CARD, fg=TXT,
+                                   font=("Microsoft YaHei UI", 10), anchor="w")
+        self.lbl_status.pack(side="left", fill="x", expand=True)
+
         head = tk.Frame(self.root, bg=BG)
         head.pack(fill="x", pady=(12, 0), padx=4)
         tk.Label(head, text=APP_TITLE, bg=BG, fg=TXT,
@@ -1233,8 +1430,16 @@ class App:
                  padx=10, pady=4
                  ).pack(side="right", padx=10)
 
-        # ① 检测状态卡
-        card = self._card("① 环境检测")
+        # 分页容器：① 安装 · 插件修复 ② ChatGPT 启动修复
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 2))
+        tab1 = tk.Frame(self.nb, bg=BG)
+        tab2 = tk.Frame(self.nb, bg=BG)
+        self.nb.add(tab1, text=" 安装 · 插件修复 ")
+        self.nb.add(tab2, text=" ChatGPT 启动修复 ")
+
+        # ① 检测状态卡（分页 1）
+        card = self._card("① 环境检测", parent=tab1)
         grid = tk.Frame(card, bg=CARD)
         grid.pack(fill="x", side="top", anchor="w", pady=(4, 2))
         self.rows = {}
@@ -1257,8 +1462,8 @@ class App:
                                 bd=1, padx=10, cursor="hand2")
         btn_recheck.pack(anchor="ne", side="bottom")
 
-        # ② 安装 / 修复卡
-        card2 = self._card("② 安装 / 修复")
+        # ② 安装 / 修复卡（分页 1）
+        card2 = self._card("② 安装 / 修复", parent=tab1)
         self.big_btn = tk.Button(card2, text="一键安装 Node.js 和 Codex CLI",
                                  font=("Microsoft YaHei UI", 11, "bold"),
                                  bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
@@ -1303,29 +1508,49 @@ class App:
         tk.Label(card2, text="镜像策略：npmmirror ≥5 分钟未完成 → 自动切换 npm 官方源重试",
                  bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
-        # 进度卡
-        card3 = self._card()
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Installer.Horizontal.TProgressbar", thickness=8,
-                        background=PRIMARY, troughcolor="#E2E8F0", borderwidth=0)
-        self.bar = ttk.Progressbar(card3, mode="indeterminate", maximum=24,
-                                   style="Installer.Horizontal.TProgressbar")
-        self.bar.pack(fill="x", pady=(2, 6))
-        row3 = tk.Frame(card3, bg=CARD)
-        row3.pack(fill="x")
-        self.lbl_status = tk.Label(row3, text="就绪。正在检测本机环境…", bg=CARD, fg=TXT,
-                                   font=("Microsoft YaHei UI", 10), anchor="w")
-        self.lbl_status.pack(side="left", fill="x", expand=True)
+        # ChatGPT 启动修复分页
+        cardg = self._card("① 问题检测与一键修复", parent=tab2)
+        tk.Label(cardg, text=GPT_ERROR_TEXT, bg="#FEF2F2", fg=RED_FG,
+                 font=("Consolas", 9), wraplength=610, justify="left",
+                 padx=10, pady=8).pack(fill="x", pady=(4, 8))
+        gridg = tk.Frame(cardg, bg=CARD)
+        gridg.pack(fill="x", anchor="w", pady=(0, 2))
+        self.rows_g = {}
+        for i, (key, name) in enumerate([("pkg", "ChatGPT 桌面应用"),
+                                         ("cli", "codex.exe CLI"),
+                                         ("env", "CODEX_CLI_PATH")]):
+            tk.Label(gridg, text=name, bg=CARD, fg=TXT,
+                     font=("Microsoft YaHei UI", 10)).grid(row=i, column=0, sticky="w",
+                                                           padx=(2, 10), pady=3)
+            badge = tk.Label(gridg, text="检测中…", bg="#E2E8F0", fg=SUB,
+                             font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=2)
+            badge.grid(row=i, column=1, sticky="w")
+            detail = tk.Label(gridg, text="", bg=CARD, fg=SUB,
+                              font=("Microsoft YaHei UI", 9))
+            detail.grid(row=i, column=2, sticky="w", padx=12)
+            gridg.columnconfigure(2, weight=1)
+            self.rows_g[key] = (badge, detail)
+        self.btn_fix_gpt = tk.Button(cardg, text="🔧 一键修复 ChatGPT 启动报错",
+                                     font=("Microsoft YaHei UI", 11, "bold"),
+                                     bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
+                                     activeforeground="white", relief="flat",
+                                     cursor="hand2", disabledforeground="#93C5FD",
+                                     padx=16, pady=9, command=self.on_fix_gpt_click)
+        self.btn_fix_gpt.pack(fill="x", pady=(8, 6))
+        tk.Label(cardg, text="修复动作：定位 ChatGPT（OpenAI.Codex）应用内的 codex.exe → "
+                          "写入用户环境变量 CODEX_CLI_PATH → 自动重启 ChatGPT 应用",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        tk.Label(cardg, text="修改仅对当前用户生效，无需注销或重启电脑；"
+                          "若 ChatGPT 仍报错，请完全退出后重新打开一次。",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
 
         self._append_log("欢迎使用 Codex 小帮手！", "ok")
         self._append_log("一键安装 Node.js（内置离线包，无需联网）与 Codex CLI"
                          "（npm 联网安装，优先 npmmirror 镜像）。", "normal")
         self._append_log("如 Codex 桌面端插件（Chrome / 浏览器 / Computer Use）失效，"
                          "点击【② 安装 / 修复】中的【一键修复 Codex 插件】一键处理。", "normal")
+        self._append_log("ChatGPT 打不开或报 \"Unable to locate the Codex CLI binary\"？"
+                         "切到【ChatGPT 启动修复】分页一键处理。", "normal")
         self._append_log(f"© 2026 {APP_VENDOR} · 本程序仅供个人学习与分享使用", "dim")
 
     def _about(self, event=None):
@@ -1364,6 +1589,7 @@ class App:
             self.q.put(("status", "正在检测本机环境…"))
         info = detect()
         self.q.put(("info", info))
+        self.q.put(("gpt_info", detect_gpt_env()))
         if idle:
             self.q.put(("status", "检测完成。点击上方按钮即可开始安装。"))
 
@@ -1371,7 +1597,8 @@ class App:
         """统一切换所有操作按钮的可 用/禁用 状态与进度条。"""
         self.busy = busy
         st = tk.DISABLED if busy else "normal"
-        for b in (self.big_btn, self.btn_node_only, self.btn_codex_only, self.btn_fix):
+        for b in (self.big_btn, self.btn_node_only, self.btn_codex_only,
+                  self.btn_fix, self.btn_fix_gpt):
             b.configure(state=st)
         self.btn_cancel.configure(state="normal" if busy else tk.DISABLED)
         if busy:
@@ -1408,6 +1635,16 @@ class App:
         self.worker_thread = threading.Thread(target=self.worker.run_fix, daemon=True)
         self.worker_thread.start()
 
+    def on_fix_gpt_click(self):
+        if self.busy:
+            return
+        self._final_shown = False
+        self._set_busy(True)
+        self._append_log("—— 开始：ChatGPT 启动修复 ——", "ok")
+        self.worker_thread = threading.Thread(target=self.worker.run_fix_gpt,
+                                              daemon=True)
+        self.worker_thread.start()
+
     # ---------- 检测结果渲染 ----------
     def render_info(self, info):
         def badge(key, text, kind):
@@ -1433,6 +1670,36 @@ class App:
         _, d3 = self.rows["codex"]
         d3.configure(text=info.get("codex_shim") or "")
 
+    def render_gpt_info(self, info):
+        """渲染【ChatGPT 启动修复】分页的检测状态。"""
+        def badge(key, text, kind, detail=None):
+            colors = {"ok": (GREEN_BG, GREEN_FG), "bad": (RED_BG, RED_FG),
+                      "na": ("#E2E8F0", SUB)}[kind]
+            b, d = self.rows_g[key]
+            b.configure(text=text, bg=colors[0], fg=colors[1])
+            if detail:
+                d.configure(text=detail)
+
+        pkg = info.get("pkg")
+        if pkg:
+            badge("pkg", f"✓ v{pkg.get('version')}", "ok", pkg.get("location") or "")
+        else:
+            badge("pkg", "✗ 未安装", "bad", "未检测到 OpenAI.Codex 桌面应用（ChatGPT）")
+
+        cli = info.get("cli")
+        if cli:
+            badge("cli", "✓ 已找到", "ok", cli)
+        else:
+            badge("cli", "✗ 未找到", "bad", "请先到【安装 · 插件修复】页安装 Codex CLI")
+
+        env = (info.get("env") or "").strip()
+        if env:
+            valid = os.path.isfile(env)
+            badge("env", "✓ 已设置" if valid else "⚠ 指向的文件不存在",
+                  "ok" if valid else "bad", env)
+        else:
+            badge("env", "✗ 未设置", "bad", "这正是 ChatGPT 启动报错的常见原因")
+
     # ---------- 队列轮询 ----------
     def _poll_queue(self):
         try:
@@ -1451,6 +1718,8 @@ class App:
                         self.lbl_status.configure(text=f"{lbl}（已进行 {msg[1]} 秒）")
                 elif kind == "info":
                     self.render_info(msg[1])
+                elif kind == "gpt_info":
+                    self.render_gpt_info(msg[1])
                 elif kind == "fix_manual":
                     try:
                         messagebox.showinfo(
