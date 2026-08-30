@@ -26,7 +26,7 @@ CREATE_NEW_CONSOLE = 0x00000010
 
 APP_TITLE = "Codex 小帮手"
 APP_VENDOR = "小枳ai分享"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.2"
 
 # ------------------------------------------------------------- 版权与水印 --
 # © 小枳ai分享 · 作者标识以内置方式嵌入（暗水印），解码后即作者主页。
@@ -967,9 +967,11 @@ class Installer:
         for url in NODE_MSI_URLS:
             try:
                 self.log("下载源：" + url)
+                self.q.put(("progress", 0.0))
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 got = 0
                 next_report = 0
+                last_pct = -1
                 with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as f:
                     cl = resp.headers.get("Content-Length")
                     total = int(cl) if cl else 0
@@ -981,13 +983,21 @@ class Installer:
                         f.write(chunk)
                         got += len(chunk)
                         mb = got / 1048576
-                        if mb >= next_report:
+                        pct = int(got * 100 / total) if total else -1
+                        if mb >= next_report or (pct >= 0 and pct != last_pct):
                             next_report = int(mb) + 1
-                            tail = f"/{total / 1048576:.0f}MB" if total else ""
-                            self.status(f"正在下载 Node.js 离线包… {mb:.1f}MB{tail}")
+                            last_pct = pct
+                            if total:
+                                # Progress Bar（determinate）+ 状态栏百分比
+                                self.status(f"正在下载 Node.js 离线包… {mb:.1f}/"
+                                            f"{total / 1048576:.0f}MB（{pct}%）")
+                                self.q.put(("progress", got / total))
+                            else:
+                                self.status(f"正在下载 Node.js 离线包… {mb:.1f}MB")
                 if total and got < total:
                     raise IOError("下载不完整")
                 self.log(f"下载完成：{dest}（{got / 1048576:.1f} MB）", "ok")
+                self.q.put(("progress", None))
                 return dest
             except OpCancelled:
                 raise
@@ -1291,6 +1301,62 @@ PRIMARY_D = "#1D4ED8"
 GREEN_BG, GREEN_FG = "#DCFCE7", "#166534"
 RED_BG, RED_FG = "#FEE2E2", "#991B1B"
 AMBER_FG = "#B45309"
+SKELETON_1, SKELETON_2 = "#E2E8F0", "#F8FAFC"   # 骨架屏徽章“呼吸”两端色
+CHIP, CHIP_HOVER = "#F1F5F9", "#E2E8F0"         # 次级扁平按钮（白卡上的“软”按钮）
+SUB_DARK = "#475569"                            # 浅灰背景上的次级文字（保证对比度）
+
+
+class Spinner(tk.Canvas):
+    """环形加载指示器（纯 tkinter canvas，无需图片资源）。
+    - start()/stop()：indeterminate 模式，弧段匀速旋转，用于时长未知的等待；
+    - set_progress(frac)：determinate 模式，按 0~1 直接填充，适合小空间展示
+      明确进度（当前界面未用到 determinate，备用，见交接文档“加载动效清单”）。"""
+
+    def __init__(self, master, size=16, ring=3, color=PRIMARY, bg=CARD):
+        super().__init__(master, width=size, height=size, bg=bg,
+                         highlightthickness=0, bd=0)
+        pad = ring // 2 + 1
+        bbox = (pad, pad, size - pad, size - pad)
+        self._trough = self.create_arc(bbox, start=0, extent=359.9, style="arc",
+                                       outline=BORDER, width=ring)
+        self._arc = self.create_arc(bbox, start=90, extent=90, style="arc",
+                                    outline=color, width=ring)
+        self._angle = 90
+        self._after_id = None
+        self._set_visible(False)   # 空闲时整个隐藏，避免误读为“卡住的加载”
+
+    def _set_visible(self, on):
+        st = "normal" if on else "hidden"
+        for item in (self._trough, self._arc):
+            self.itemconfigure(item, state=st)
+
+    def start(self):
+        self._set_visible(True)
+        if self._after_id is None:
+            self._spin()
+
+    def stop(self):
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        self._set_visible(False)
+
+    def set_progress(self, frac):
+        """determinate：frac∈[0,1]，同时停止旋转。"""
+        self.stop()
+        frac = max(0.0, min(1.0, float(frac)))
+        self.itemconfigure(self._arc, start=90, extent=359.9 * frac)
+
+    def _spin(self):
+        try:
+            self._angle = (self._angle - 15) % 360
+            self.itemconfigure(self._arc, start=self._angle)
+            self._after_id = self.after(40, self._spin)
+        except tk.TclError:
+            self._after_id = None   # 窗口已销毁，结束动画循环
 
 
 class App:
@@ -1300,7 +1366,7 @@ class App:
         # 窗口高度自适应屏幕：小屏幕（如 1366x768 的 Win10 笔记本）不超屏，
         # 保证底部日志区完整可见
         scr_h = root.winfo_screenheight()
-        win_h = max(520, min(650, scr_h - 150))
+        win_h = max(520, min(680, scr_h - 120))
         root.geometry(f"700x{win_h}")
         root.minsize(640, 520)
         root.configure(bg=BG)
@@ -1314,8 +1380,16 @@ class App:
         self.q = queue.Queue()
         self.worker = Installer(self.q)
         self.busy = False
+        self._detecting = False
         self.base_status = ""
         self._final_shown = False
+        # 加载动效内部状态
+        self._skeleton_after = None      # 骨架屏脉冲循环
+        self._skeleton_phase = 0
+        self._btn_loading = None         # (btn, 原文本) Button Loading 目标
+        self._btn_loading_text = ""
+        self._btn_dots = 0
+        self._btn_after = None           # 按钮省略号动画循环
 
         self._build_ui()
         self._startup_notice()
@@ -1365,60 +1439,17 @@ class App:
         return c
 
     def _build_ui(self):
-        # 页脚与日志卡最先布局（side=bottom 优先占位）：窗口高度不足时，
-        # 上方卡片自动被压缩，日志区始终完整可见。
+        # pack 顺序 = 空间分配顺序：页脚、标题、分页容器先拿到各自请求高度，
+        # 日志卡与状态卡随后从底边堆叠；窗口高度不足时由最后 pack 的状态卡
+        # 吸收压缩，保证分页内的操作按钮、说明文字永远完整可见。
         foot = tk.Label(self.root, text=f"© 2026 {APP_VENDOR} · 点击查看关于",
-                        bg=BG, fg=SUB, font=("Microsoft YaHei UI", 8),
+                        bg=BG, fg=SUB_DARK, font=("Microsoft YaHei UI", 9),
                         cursor="hand2")
         foot.pack(side="bottom", pady=(2, 4))
         foot.bind("<Button-1>", self._about)
 
-        # ③ 日志卡
-        card4 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
-                         highlightthickness=1, padx=10, pady=6)
-        card4.pack(side="bottom", fill="both", expand=True, padx=14, pady=(8, 0))
-        log_head = tk.Frame(card4, bg=CARD)
-        log_head.pack(fill="x")
-        tk.Label(log_head, text="③ 详细日志", bg=CARD, fg=TXT,
-                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
-        tk.Button(log_head, text="清空日志", font=("Microsoft YaHei UI", 8),
-                  bg="#F8FAFC", relief="groove", bd=1, cursor="hand2",
-                  command=self._clear_log).pack(side="right")
-        self.txt = tk.Text(card4, height=6, bg=CARD, fg=TXT, font=("Consolas", 9),
-                           wrap="word", relief="flat", state=tk.DISABLED, takefocus=0)
-        self.txt.pack(fill="both", expand=True, side="left")
-        sb = tk.Scrollbar(card4, command=self.txt.yview)
-        sb.pack(side="right", fill="y")
-        self.txt.configure(yscrollcommand=sb.set)
-        for tag, color in [("ok", GREEN_FG), ("warn", AMBER_FG), ("err", "#DC2626"),
-                           ("dim", SUB), ("normal", TXT)]:
-            self.txt.tag_configure(tag, foreground=color)
-
-        # 状态/进度条（底部固定条，两个分页共用）
-        card3 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
-                         highlightthickness=1, padx=14, pady=8)
-        card3.pack(side="bottom", fill="x", padx=14, pady=(8, 8))
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Installer.Horizontal.TProgressbar", thickness=8,
-                        background=PRIMARY, troughcolor="#E2E8F0", borderwidth=0)
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"),
-                        padding=(16, 6))
-        self.bar = ttk.Progressbar(card3, mode="indeterminate", maximum=24,
-                                   style="Installer.Horizontal.TProgressbar")
-        self.bar.pack(fill="x", pady=(2, 6))
-        row3 = tk.Frame(card3, bg=CARD)
-        row3.pack(fill="x")
-        self.lbl_status = tk.Label(row3, text="就绪。正在检测本机环境…", bg=CARD, fg=TXT,
-                                   font=("Microsoft YaHei UI", 10), anchor="w")
-        self.lbl_status.pack(side="left", fill="x", expand=True)
-
         head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", pady=(12, 0), padx=4)
+        head.pack(fill="x", pady=(8, 0), padx=4)
         tk.Label(head, text=APP_TITLE, bg=BG, fg=TXT,
                  font=("Microsoft YaHei UI", 15, "bold")).pack(side="left", padx=10)
         admin = is_admin()
@@ -1432,14 +1463,79 @@ class App:
 
         # 分页容器：① 安装 · 插件修复 ② ChatGPT 启动修复
         self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 2))
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 0))
         tab1 = tk.Frame(self.nb, bg=BG)
         tab2 = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab1, text=" 安装 · 插件修复 ")
         self.nb.add(tab2, text=" ChatGPT 启动修复 ")
 
-        # ① 检测状态卡（分页 1）
+        # ③ 日志卡（expand：分页内容拿足请求高度后，剩余空间全给日志）
+        card4 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, padx=10, pady=6)
+        card4.pack(side="bottom", fill="both", expand=True, padx=14, pady=(8, 0))
+        log_head = tk.Frame(card4, bg=CARD)
+        log_head.pack(fill="x")
+        tk.Label(log_head, text="③ 详细日志", bg=CARD, fg=TXT,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        tk.Button(log_head, text="清空日志", font=("Microsoft YaHei UI", 9),
+                  bg=CHIP, fg=TXT, relief="flat", bd=0,
+                  activebackground=CHIP_HOVER, activeforeground=TXT,
+                  cursor="hand2", padx=10,
+                  command=self._clear_log).pack(side="right")
+        self.txt = tk.Text(card4, height=3, bg=CARD, fg=TXT, font=("Consolas", 9),
+                           wrap="word", relief="flat", state=tk.DISABLED, takefocus=0)
+        self.txt.pack(fill="both", expand=True, side="left")
+        sb = tk.Scrollbar(card4, command=self.txt.yview)
+        sb.pack(side="right", fill="y")
+        self.txt.configure(yscrollcommand=sb.set)
+        for tag, color in [("ok", GREEN_FG), ("warn", AMBER_FG), ("err", "#DC2626"),
+                           ("dim", SUB), ("normal", TXT)]:
+            self.txt.tag_configure(tag, foreground=color)
+
+        # 状态/进度条（底部固定条，两个分页共用）
+        card3 = tk.Frame(self.root, bg=CARD, highlightbackground=BORDER,
+                         highlightthickness=1, padx=14, pady=8)
+        card3.pack(side="bottom", fill="x", padx=14, pady=(6, 2))
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Installer.Horizontal.TProgressbar", thickness=8,
+                        background=PRIMARY, troughcolor="#E2E8F0", borderwidth=0)
+        style.configure("TNotebook", background=BG, borderwidth=0,
+                        tabmargins=(14, 6, 14, 0))
+        style.configure("TNotebook.Tab", font=("Microsoft YaHei UI", 10, "bold"),
+                        padding=(18, 6), background=CHIP, foreground=SUB,
+                        bordercolor=BG, lightcolor=BG, darkcolor=BG)
+        style.map("TNotebook.Tab",
+                  background=[("selected", CARD)],
+                  foreground=[("selected", PRIMARY_D)],
+                  expand=[("selected", (1, 1, 1, 0))])
+        # 进度条只用于“可计算进度”（如离线包下载，determinate 真实百分比）；
+        # 时长未知的等待一律由左侧环形 Spinner 表达，避免同一任务双指示器。
+        self.bar = ttk.Progressbar(card3, mode="determinate", maximum=100,
+                                   style="Installer.Horizontal.TProgressbar")
+        self.bar.pack(fill="x", pady=(2, 2))
+        row3 = tk.Frame(card3, bg=CARD)
+        row3.pack(fill="x")
+        self.spinner = Spinner(row3, size=16, ring=3)
+        self.spinner.pack(side="left", padx=(0, 8))
+        self.lbl_status = tk.Label(row3, text="就绪。正在检测本机环境…", bg=CARD, fg=TXT,
+                                   font=("Microsoft YaHei UI", 10), anchor="w")
+        self.lbl_status.pack(side="left", fill="x", expand=True)
+
+        # ① 检测状态卡（分页 1）——“重新检测”与标题同行，节省纵向空间：
+        # 分页内容总高超过窗口可用高度时 pack 会压缩卡片，底部内容（按钮行、
+        # 说明文字）会被裁掉，因此尽量压缩各卡片的固定占用。
         card = self._card("① 环境检测", parent=tab1)
+        self.btn_recheck = tk.Button(card, text="↻ 重新检测", command=self.on_detect_click,
+                                     font=("Microsoft YaHei UI", 9), bg=CHIP, fg=TXT,
+                                     relief="flat", activebackground=CHIP_HOVER,
+                                     activeforeground=TXT, bd=0,
+                                     disabledforeground="#94A3B8",
+                                     padx=12, cursor="hand2")
+        self.btn_recheck.pack(side="right")
         grid = tk.Frame(card, bg=CARD)
         grid.pack(fill="x", side="top", anchor="w", pady=(4, 2))
         self.rows = {}
@@ -1447,7 +1543,7 @@ class App:
                                          ("codex", "Codex CLI")]):
             tk.Label(grid, text=name, bg=CARD, fg=TXT,
                      font=("Microsoft YaHei UI", 10)).grid(row=i, column=0, sticky="w",
-                                                           padx=(2, 10), pady=3)
+                                                           padx=(2, 10), pady=2)
             badge = tk.Label(grid, text="检测中…", bg="#E2E8F0", fg=SUB,
                              font=("Microsoft YaHei UI", 9, "bold"), padx=10, pady=2)
             badge.grid(row=i, column=1, sticky="w")
@@ -1456,12 +1552,6 @@ class App:
             detail.grid(row=i, column=2, sticky="w", padx=12)
             grid.columnconfigure(2, weight=1)
             self.rows[key] = (badge, detail)
-        btn_recheck = tk.Button(card, text="↻ 重新检测", command=self.on_detect_click,
-                                font=("Microsoft YaHei UI", 9), bg="#F8FAFC", fg=TXT,
-                                relief="groove", activebackground="#EEF2FF",
-                                bd=1, padx=10, cursor="hand2")
-        btn_recheck.pack(anchor="ne", side="bottom")
-
         # ② 安装 / 修复卡（分页 1）
         card2 = self._card("② 安装 / 修复", parent=tab1)
         self.big_btn = tk.Button(card2, text="一键安装 Node.js 和 Codex CLI",
@@ -1469,23 +1559,29 @@ class App:
                                  bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
                                  activeforeground="white", relief="flat", cursor="hand2",
                                  disabledforeground="#93C5FD",
-                                 padx=16, pady=9, command=lambda: self.start_task(True, True))
-        self.big_btn.pack(fill="x", pady=(6, 8))
+                                 padx=16, pady=7,
+                                 command=lambda: self.start_task(True, True,
+                                                                 self.big_btn))
+        self.big_btn.pack(fill="x", pady=(4, 6))
 
         row = tk.Frame(card2, bg=CARD)
         row.pack(fill="x")
-        small_opts = dict(font=("Microsoft YaHei UI", 9), relief="groove", bd=1,
-                          bg="#F8FAFC", fg=TXT, activebackground="#EEF2FF",
+        small_opts = dict(font=("Microsoft YaHei UI", 9), relief="flat", bd=0,
+                          bg=CHIP, fg=TXT, activebackground=CHIP_HOVER,
+                          activeforeground=TXT,
                           disabledforeground="#94A3B8", cursor="hand2")
         self.btn_node_only = tk.Button(row, text="仅安装 Node.js", padx=10, pady=6,
-                                       command=lambda: self.start_task(True, False),
+                                       command=lambda: self.start_task(
+                                           True, False, self.btn_node_only),
                                        **small_opts)
         self.btn_codex_only = tk.Button(row, text="仅安装 Codex CLI", padx=10, pady=6,
-                                        command=lambda: self.start_task(False, True),
+                                        command=lambda: self.start_task(
+                                            False, True, self.btn_codex_only),
                                         **small_opts)
         self.btn_cancel = tk.Button(row, text="取消", padx=14, pady=6,
                                     font=("Microsoft YaHei UI", 9, "bold"),
-                                    bg="#FEF2F2", fg=RED_FG, relief="groove", bd=1,
+                                    bg="#FEF2F2", fg=RED_FG, relief="flat", bd=0,
+                                    activebackground="#FEE2E2", activeforeground=RED_FG,
                                     state=tk.DISABLED, disabledforeground="#DC2626",
                                     cursor="hand2", command=self.on_cancel)
         self.btn_node_only.pack(side="left")
@@ -1498,15 +1594,13 @@ class App:
                                  font=("Microsoft YaHei UI", 9, "bold"),
                                  bg="#EFF6FF", fg=PRIMARY_D,
                                  activebackground="#DBEAFE", activeforeground=PRIMARY_D,
-                                 relief="groove", bd=1, disabledforeground="#93C5FD",
-                                 cursor="hand2", padx=10, pady=6,
+                                 relief="flat", bd=0, disabledforeground="#93C5FD",
+                                 cursor="hand2", padx=12, pady=4,
                                  command=self.on_fix_click)
         self.btn_fix.pack(fill="x", pady=(8, 0))
-        tk.Label(card2, text="修复流程：自动安装 fast-patch 技能 → 设为 Full Access → "
-                          "打开 PowerShell 版 Codex 并自动输入 /goal 修复指令",
-                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w", pady=(4, 0))
-        tk.Label(card2, text="镜像策略：npmmirror ≥5 分钟未完成 → 自动切换 npm 官方源重试",
-                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        tk.Label(card2, text="自动安装修复技能 → 设为 Full Access → 打开 Codex 输入 /goal",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 9),
+                 wraplength=600).pack(anchor="w", pady=(4, 0))
 
         # ChatGPT 启动修复分页
         cardg = self._card("① 问题检测与一键修复", parent=tab2)
@@ -1535,18 +1629,21 @@ class App:
                                      bg=PRIMARY, fg="white", activebackground=PRIMARY_D,
                                      activeforeground="white", relief="flat",
                                      cursor="hand2", disabledforeground="#93C5FD",
-                                     padx=16, pady=9, command=self.on_fix_gpt_click)
+                                     padx=16, pady=7, command=self.on_fix_gpt_click)
         self.btn_fix_gpt.pack(fill="x", pady=(8, 6))
-        tk.Label(cardg, text="修复动作：定位 ChatGPT（OpenAI.Codex）应用内的 codex.exe → "
-                          "写入用户环境变量 CODEX_CLI_PATH → 自动重启 ChatGPT 应用",
-                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
-        tk.Label(cardg, text="修改仅对当前用户生效，无需注销或重启电脑；"
-                          "若 ChatGPT 仍报错，请完全退出后重新打开一次。",
-                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
+        tk.Label(cardg, text="自动定位 ChatGPT 内置的 codex.exe → "
+                          "写入环境变量 CODEX_CLI_PATH → 重启 ChatGPT",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 9),
+                 wraplength=600).pack(anchor="w", pady=(2, 0))
+        tk.Label(cardg, text="仅对当前用户生效，无需重启电脑；"
+                          "若仍报错，请完全退出 ChatGPT 后重新打开。",
+                 bg=CARD, fg=SUB, font=("Microsoft YaHei UI", 9),
+                 wraplength=600).pack(anchor="w")
 
         self._append_log("欢迎使用 Codex 小帮手！", "ok")
         self._append_log("一键安装 Node.js（内置离线包，无需联网）与 Codex CLI"
-                         "（npm 联网安装，优先 npmmirror 镜像）。", "normal")
+                         "（npm 联网安装，优先 npmmirror 镜像，"
+                         "超 5 分钟自动切官方源）。", "normal")
         self._append_log("如 Codex 桌面端插件（Chrome / 浏览器 / Computer Use）失效，"
                          "点击【② 安装 / 修复】中的【一键修复 Codex 插件】一键处理。", "normal")
         self._append_log("ChatGPT 打不开或报 \"Unable to locate the Codex CLI binary\"？"
@@ -1581,36 +1678,48 @@ class App:
 
     # ---------- 动作 ----------
     def on_detect_click(self):
+        if self._detecting:
+            return
         threading.Thread(target=self._detect_job, daemon=True).start()
 
     def _detect_job(self):
         idle = (not self.busy) and (not self._final_shown)
+        self.q.put(("detect_begin",))
         if idle:
             self.q.put(("status", "正在检测本机环境…"))
-        info = detect()
+        try:
+            info = detect()
+            gpt = detect_gpt_env()
+        except Exception as e:
+            self.q.put(("log", "err", "环境检测失败：" + str(e)))
+            info, gpt = {}, {}
+        # 两页结果集齐后一起发，保证骨架脉冲在两页结果渲染前不中断
         self.q.put(("info", info))
-        self.q.put(("gpt_info", detect_gpt_env()))
+        self.q.put(("gpt_info", gpt))
         if idle:
             self.q.put(("status", "检测完成。点击上方按钮即可开始安装。"))
 
     def _set_busy(self, busy: bool):
-        """统一切换所有操作按钮的可 用/禁用 状态与进度条。"""
+        """统一切换所有操作按钮的可用/禁用状态与加载指示。"""
         self.busy = busy
         st = tk.DISABLED if busy else "normal"
         for b in (self.big_btn, self.btn_node_only, self.btn_codex_only,
-                  self.btn_fix, self.btn_fix_gpt):
+                  self.btn_fix, self.btn_fix_gpt, self.btn_recheck):
             b.configure(state=st)
         self.btn_cancel.configure(state="normal" if busy else tk.DISABLED)
         if busy:
-            self.bar.start(40)
+            self.spinner.start()      # Spinner：时长未知，仅提示系统正在处理
         else:
-            self.bar.stop()
+            self.spinner.stop()
+            self.bar.configure(value=0)
+            self._restore_buttons()
 
-    def start_task(self, want_node: bool, want_codex: bool):
+    def start_task(self, want_node: bool, want_codex: bool, btn=None):
         if self.busy:
             return
         self._final_shown = False
         self._set_busy(True)
+        self._set_button_loading(btn or self.big_btn, "正在安装")
         parts = []
         if want_node:
             parts.append("Node.js")
@@ -1631,6 +1740,7 @@ class App:
             return
         self._final_shown = False
         self._set_busy(True)
+        self._set_button_loading(self.btn_fix, "正在修复")
         self._append_log("—— 开始：Codex 插件一键修复 ——", "ok")
         self.worker_thread = threading.Thread(target=self.worker.run_fix, daemon=True)
         self.worker_thread.start()
@@ -1640,13 +1750,88 @@ class App:
             return
         self._final_shown = False
         self._set_busy(True)
+        self._set_button_loading(self.btn_fix_gpt, "正在修复")
         self._append_log("—— 开始：ChatGPT 启动修复 ——", "ok")
         self.worker_thread = threading.Thread(target=self.worker.run_fix_gpt,
                                               daemon=True)
         self.worker_thread.start()
 
+    # ---------- Button Loading：被点击的按钮切换为加载态 ----------
+    def _set_button_loading(self, btn, text):
+        """按钮文字变为“text+动态省略号”，配合禁用态防止重复点击。"""
+        self._restore_buttons()
+        if btn is None:
+            return
+        self._btn_loading = (btn, str(btn.cget("text")))
+        self._btn_loading_text = text
+        self._btn_dots = 0
+        self._animate_button()
+
+    def _animate_button(self):
+        if not self._btn_loading:
+            return
+        btn, _orig = self._btn_loading
+        try:
+            btn.configure(text=self._btn_loading_text + "." * self._btn_dots)
+            self._btn_dots = (self._btn_dots + 1) % 4
+            self._btn_after = self.root.after(400, self._animate_button)
+        except tk.TclError:
+            self._btn_loading = None
+            self._btn_after = None
+
+    def _restore_buttons(self):
+        """结束加载态：还原被点击按钮的原始文字。"""
+        if self._btn_after is not None:
+            try:
+                self.root.after_cancel(self._btn_after)
+            except Exception:
+                pass
+            self._btn_after = None
+        if self._btn_loading:
+            btn, orig = self._btn_loading
+            try:
+                btn.configure(text=orig)
+            except tk.TclError:
+                pass
+            self._btn_loading = None
+
+    # ---------- Skeleton：检测期间灰色占位徽章轻微呼吸 ----------
+    def _start_skeleton(self):
+        if self._skeleton_after is None:
+            self._pulse_skeleton()
+
+    def _pulse_skeleton(self):
+        self._skeleton_phase ^= 1
+        bg = SKELETON_1 if self._skeleton_phase else SKELETON_2
+        for rows in (self.rows, self.rows_g):
+            for badge, _d in rows.values():
+                try:
+                    badge.configure(bg=bg)
+                except tk.TclError:
+                    pass
+        self._skeleton_after = self.root.after(420, self._pulse_skeleton)
+
+    def _stop_skeleton(self):
+        if self._skeleton_after is not None:
+            try:
+                self.root.after_cancel(self._skeleton_after)
+            except Exception:
+                pass
+            self._skeleton_after = None
+
     # ---------- 检测结果渲染 ----------
+    def _on_detect_done(self):
+        """一次环境检测结束（首条结果到达即算）：停骨架脉冲、还原检测按钮。"""
+        self._detecting = False
+        self._stop_skeleton()
+        if self._btn_loading and self._btn_loading[0] is self.btn_recheck:
+            self._restore_buttons()
+        if not self.busy:
+            self.spinner.stop()
+            self.btn_recheck.configure(state="normal")
+
     def render_info(self, info):
+        self._on_detect_done()
         def badge(key, text, kind):
             colors = {"ok": (GREEN_BG, GREEN_FG), "bad": (RED_BG, RED_FG),
                       "na": ("#E2E8F0", SUB)}[kind]
@@ -1672,6 +1857,7 @@ class App:
 
     def render_gpt_info(self, info):
         """渲染【ChatGPT 启动修复】分页的检测状态。"""
+        self._on_detect_done()
         def badge(key, text, kind, detail=None):
             colors = {"ok": (GREEN_BG, GREEN_FG), "bad": (RED_BG, RED_FG),
                       "na": ("#E2E8F0", SUB)}[kind]
@@ -1716,6 +1902,22 @@ class App:
                     lbl = self.base_status.split("（")[0] if self.base_status else ""
                     if lbl:
                         self.lbl_status.configure(text=f"{lbl}（已进行 {msg[1]} 秒）")
+                elif kind == "detect_begin":
+                    self._detecting = True
+                    if not self.busy:
+                        self.spinner.start()
+                    self._start_skeleton()
+                    self.btn_recheck.configure(state=tk.DISABLED)
+                    self._set_button_loading(self.btn_recheck, "检测中")
+                elif kind == "progress":
+                    # Progress Bar：仅用于可计算进度的阶段（离线包下载），
+                    # None 表示该阶段结束、清零复位
+                    frac = msg[1]
+                    if frac is None:
+                        self.bar.configure(value=0)
+                    else:
+                        self.bar.configure(mode="determinate",
+                                           value=max(0.0, min(1.0, frac)) * 100)
                 elif kind == "info":
                     self.render_info(msg[1])
                 elif kind == "gpt_info":
