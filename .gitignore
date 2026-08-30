@@ -11,3 +11,7 @@ __pycache__/
 # 系统
 Thumbs.db
 .DS_Store
+
+# 运行时产物
+*.log
+*.spec.bak

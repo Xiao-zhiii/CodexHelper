@@ -2,6 +2,13 @@
  Codex 小帮手  使用说明（Node.js + Codex CLI 一键安装 · 插件修复）
 ═══════════════════════════════════════════════════════
 
+【v1.6.0 全新浏览器界面】
+双击 exe 后会自动打开浏览器界面（本地运行，数据不出本机）；
+关闭浏览器窗口后程序约 45 秒自动退出，也可点右上角【关闭程序】。
+界面共九个标签页：安装·修复、桌面端 升降级、Codex 环境检测，
+以及配置中心（系统信息 / config.toml / auth.json / .cc-switch /
+Codex++ / 原始文件，含供应商连通性测试与敏感值打码开关）。
+
 【这是什么】
 一个完全独立的绿色单文件程序（Codex小帮手.exe，约 41 MB），
 内部已打包 Node.js v24.18.0 离线安装包，把它拷贝到任何 Win10 / Win11
@@ -91,13 +98,31 @@ Computer Use（电脑操作）插件无法使用、按钮变灰或功能消失�
    - NodeCodexSetup.spec        PyInstaller 打包配置
    - dist\NodeCodexSetup.exe    打包原始输出
 
-【重新打包方法】（修改 src\node_codex_installer.py 后）
-  pip install pyinstaller
-  python -m PyInstaller --onefile --windowed --name NodeCodexSetup \
-      --icon installer.ico \
-      --add-data "node-v24.18.0-x64.msi;assets" \
-      --add-data "installer.ico;assets" \
-      node_codex_installer.py
+【重新打包方法】（修改 src\ 下的源码后）
+  pip install pyinstaller pillow pywebview
+  cd src
+  python -m PyInstaller NodeCodexSetup.spec --noconfirm --clean
+  产物 src\dist\NodeCodexSetup.exe → 复制为 Codex小帮手.exe
+
+【Codex 桌面端 降级 / 升级】（v1.5.0 新增分页）
+适用场景：Codex 桌面端（ChatGPT）新版本不好用，想退回旧版本；或想装镜像
+里的指定版本。点击【获取镜像版本列表】即可看到 Wangnov/codex-app-mirror
+镜像最近 50 个版本（含大小、日期，并标注 ▲可升级 / ▼可降级 / ●当前版本）。
+· 下载自动走最适合的通道：ghproxylist.com 加速优先（国内友好），
+  检测到系统代理则全程走代理，直连兜底；
+· 下载完成后自动校验官方 SHA256，再自动安装（支持降级覆盖）；
+· 单版本安装包约 800 MB；安装会先关闭正在运行的 ChatGPT；
+  降级时会先卸载当前版本再安装（只移除应用本体与本地缓存，
+  不影响 ~/.codex 里的技能、配置、密钥等用户数据；
+  应用内登录状态需在重装后重新登录），完成后请从开始菜单重新打开。
+
+【Codex 环境检测】（v1.5.0 新增分页）
+一键扫描并集中展示：
+· ~/.codex 目录内的 .env 文件（存在则列出其中的键值）；
+· 系统变量 / 用户变量 / 当前进程中与 代理（HTTP_PROXY、HTTPS_PROXY、
+  ALL_PROXY、NO_PROXY 等）、API Key、Codex 相关的环境变量；
+· 本机代理检测结果（系统代理 / 代理环境变量）。
+安全提示：密钥类变量只显示首尾片段（打码），代理地址与普通路径完整显示。
 
 【界面加载反馈】（v1.4.1 优化）
 · 环境检测期间：检测项显示灰色"检测中…"占位徽章（轻微呼吸动效），
@@ -112,7 +137,35 @@ Computer Use（电脑操作）插件无法使用、按钮变灰或功能消失�
 · 说明文字与页脚字号增大，更易阅读；
 · 界面文案更简洁。
 
-生成日期：2026-08-30（v1.4.2）
+【Codex 历史记录】（v1.7.0 新增分页）
+管理 Codex 里的对话记录（读取 ~/.codex/state_5.sqlite 的会话索引）。
+· 列表：显示标题、时间、体积、供应商与工作目录；可按 全部/活跃/已归档 筛选，
+  也可按标题或会话 ID 搜索；
+· 归档 / 恢复：勾选后点【归档所选】/【恢复所选】。归档不是删除——
+  会话文件会移入 archived_sessions/ 并在库中打标记，随时可恢复；
+· 删除：勾选后点【删除所选】。会同时清理库记录、投影表、会话文件与索引，
+  不可撤销；
+· 导入：支持从 Claude Code（~/.claude/projects）导入，
+  或从另一个 Codex 数据目录导入（例如换电脑前的旧目录）；
+  Claude 的会话格式会自动转换为 Codex 的 rollout 结构（仅迁移文本内容）；
+· 安全机制：每次写操作前自动把数据库备份到
+  backups_state/codexhelper/<时间戳>_<动作>/，备份失败即中止操作。
+重要：归档 / 恢复 / 删除 / 导入 会写 SQLite 数据库。
+若 Codex 桌面端或 CLI 正在运行，数据库可能被占用而失败，
+请先完全关闭 Codex 再操作。
+
+【运行日志】（v1.7.0 新增分页）
+读取 ~/.codex/logs_2.sqlite 的运行日志，便于自行排查问题。
+· 可按级别筛选（错误 / 警告 / 信息）、按关键词搜索正文与模块名；
+· 日志库常达上百 MB，因此采用分页加载（每次一页），
+  长正文会自动截断，避免浏览器卡死；
+· 【导出为 txt】可把当前筛选结果导出，方便发给他人协助排查；
+· 页面底部同时显示本程序自身的日志（Codex Helper.log）。
+跨机器说明：无论换电脑、换 Windows 用户名，还是把用户目录重定向到其它盘，
+本工具都能自动定位到 .codex 目录（按 CODEX_HOME → config.toml →
+用户主目录 → 注册表 → MSIX 沙箱的顺序探测），无需手动指定路径。
+
+生成日期：2026-08-30（v1.7.0）
 
 ═══════════════════════════════════════════════════════
  版权与声明

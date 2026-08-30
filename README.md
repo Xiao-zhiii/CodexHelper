@@ -9,7 +9,10 @@ Codex 桌面端的 Chrome 插件 / 浏览器插件 / Computer Use 插件失效�
 
 ## 功能特性
 
-- **GUI 图形界面**：环境检测（Node.js / npm / Codex CLI 版本徽章）、一键安装、
+- **🖥 本地 Web 界面（v1.6.0 全新）**：双击 exe 自动打开浏览器界面
+  （内置 HTTP 服务，数据不出本机；关闭浏览器后空闲自动退出），
+  扁平化设计 + 骨架屏/按钮加载态/进度条等加载反馈
+- **环境检测（Node.js / npm / Codex CLI 版本徽章）、一键安装、
   分项安装、任务取消、实时日志
 - **Node.js 离线安装**：内置 `node-v24.18.0-x64.msi`（随 exe 打包，无需联网），
   msiexec 静默安装 + UAC 提权处理
@@ -37,17 +40,45 @@ Codex 桌面端的 Chrome 插件 / 浏览器插件 / Computer Use 插件失效�
   - 一键写入用户环境变量 `CODEX_CLI_PATH` 并自动重启 ChatGPT 应用
     （包内找不到 CLI 时自动回退到 npm 版 Codex 的原生二进制）
 - **管理员模式引导**：启动时检测权限，支持一键 UAC 提权重启
-- **✨ 界面加载反馈与设计焕新（v1.4.1 / v1.4.2）**：
+- **🗂 配置中心（v1.6.0 新增）**：表格化查看 `.codex/config.toml`、`auth.json`
+  （敏感值默认打码）、`.cc-switch`（供应商卡片/连通性测试/MCP/Skills）、
+  Codex++ 注入状态与系统信息，支持自定义路径
+- **📥 Codex 桌面端 降级 / 升级（v1.5.0 新增，独立分页）**：
+  从 `Wangnov/codex-app-mirror` 镜像获取最近 50 个版本（标注可升级/可降级），
+  下载自动选择通道（ghproxylist 加速优先 → 检测到系统代理则走代理 → 直连兜底），
+  SHA256 校验后安装；降级自动先卸载当前版本（不影响 ~/.codex 用户数据），
+  支持 `-ForceUpdateFromAnyVersion`
+- **🔍 Codex 环境检测（v1.5.0 新增，独立分页）**：
+  一键扫描 `~/.codex/.env` 与 系统/用户/进程三级环境变量中的
+  代理（HTTP_PROXY 等）、API Key、Codex 相关条目并集中展示
+  （密钥类值自动打码，防止截图泄露）
+- **🗂 Codex 历史记录管理（v1.7.0 新增，独立分页）**：管理 Codex 内的对话记录
+  - 列出全部会话（标题 / 时间 / 体积 / 供应商），支持按活跃·已归档筛选与关键词搜索
+  - **归档 / 恢复**：归档 = 打标记 + 会话文件移入 `archived_sessions/`，可随时恢复
+  - **删除**：清理库记录 + 投影表 + 会话文件 + 索引
+  - **导入**：从 **Claude Code**（`~/.claude/projects`）或另一个 Codex 目录导入会话，
+    Claude 格式自动转换为 Codex rollout 结构
+  - 所有写操作前自动备份数据库到 `backups_state/codexhelper/`，备份失败即中止
+- **📋 运行日志查看（v1.7.0 新增，独立分页）**：读取 `.codex/logs_2.sqlite`
+  - 按级别（错误/警告/信息）筛选、关键词搜索、分页加载
+  - 日志库常有上百 MB，因此服务端过滤后只回传一页，正文按需截断
+  - 附带「本程序日志」（`Codex Helper.log`）便于自查
+  - **跨机器可读**：会话与日志路径经用户名/盘符无关的相对化解析定位，
+    换电脑、换 Windows 账户、主目录重定向到其它盘都能读到
+- **✨ 设计系统（v1.7.0 焕新）**：按 Apple HIG 建立三层设计令牌
+  （调色板 → 语义色 → 组件），组件规则零硬编码色值
+  - 完整支持**暗色模式**（跟随系统）、键盘焦点环、标签页方向键导航、
+    `prefers-reduced-motion` 减弱动效、表格粘性表头
+- **界面加载反馈（v1.4.1 / v1.4.2）**：
   - 环境检测期间显示灰色骨架占位徽章（呼吸动效）与环形旋转指示器
   - 下载 Node.js 离线包时，底部进度条显示真实下载百分比（MB + %）
   - 点击安装/修复按钮后进入"正在安装…"加载态并锁定，防止重复点击
-  - 按钮与标签页扁平化设计、字号与对比度优化（依据 Apple HIG 走查）
 - **健壮的错误处理**：UAC 取消 / 安装超时 / 双源失败均有明确提示
 
 ## 使用方法
 
 普通用户无需看代码——直接从 [Releases](../../releases) 下载
-`CodexHelper.exe`（约 41 MB，单文件，即「Codex 小帮手」），双击运行即可。
+`CodexHelper.exe`（约 54 MB，单文件，即「Codex 小帮手」），双击运行即可。
 详细图文说明见仓库内《使用说明》或 exe 同目录文档。
 
 SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买数字签名，属正常现象）。
@@ -55,11 +86,27 @@ SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买�
 ## 目录结构
 
 ```
-├── node_codex_installer.py   # 主程序（tkinter GUI + 安装/修复逻辑，约 1100 行）
-├── make_icon.py              # 图标生成脚本（Pillow）
-├── installer.ico             # 程序图标
+├── node_codex_installer.py   # PyInstaller 入口（兼容外观，转发到 codexhelper 包）
+├── codexhelper/              # 主程序包
+│   ├── constants.py          # 常量与下载源（APP_VERSION 在此）
+│   ├── util.py winops.py     # 基础工具 / Windows 窗口与输入
+│   ├── codex_fix.py          # 插件修复后端
+│   ├── gpt_fix.py            # ChatGPT 启动修复后端
+│   ├── installer.py          # 后台任务编排
+│   ├── netenv.py             # 代理与环境变量扫描
+│   ├── mirror.py             # 桌面端镜像：版本/下载/校验/安装
+│   ├── codexpaths.py         # ★ v1.7.0 跨机器定位 CODEX_HOME
+│   ├── codexhistory.py       # ★ v1.7.0 历史会话管理
+│   ├── codexlogs.py          # ★ v1.7.0 运行日志读取
+│   ├── launcher.py           # 程序入口：起服务 → 开浏览器 → 空闲退出
+│   └── webui/                # 本地 Web 界面
+│       ├── cfgcenter.py      # 配置中心后端
+│       ├── server.py         # HTTP 路由与任务系统
+│       └── page.py           # 前端注入层
+├── codex_helper.ico          # 程序图标（exe 图标 + favicon 共用）
 ├── version_info.txt          # exe 版本资源（版权信息）
-└── NodeCodexSetup.spec       # PyInstaller 打包配置
+├── NodeCodexSetup.spec       # PyInstaller 打包配置
+└── test_fix_headless.py      # 无头回归测试
 ```
 
 ## 从源码构建
@@ -67,23 +114,16 @@ SmartScreen 提示时点【更多信息】→【仍要运行】（exe 未购买�
 需要：Windows 10/11 + Python 3.10+（开发环境为 3.13）
 
 ```bash
-pip install pyinstaller pillow
+pip install pyinstaller pillow pywebview
 
-# 1. 生成图标
-python make_icon.py
-
-# 2. 打包（需提前把 node-v24.18.0-x64.msi 放在当前目录；
+# 打包（需提前把 node-v24.18.0-x64.msi 放在 src 目录；
 #    可从 https://npmmirror.com/mirrors/node/v24.18.0/ 下载）
-python -m PyInstaller --onefile --windowed --clean --noconfirm \
-    --name NodeCodexSetup \
-    --icon installer.ico \
-    --version-file version_info.txt \
-    --add-data "node-v24.18.0-x64.msi;assets" \
-    --add-data "installer.ico;assets" \
-    node_codex_installer.py
+cd src
+python -m PyInstaller NodeCodexSetup.spec --noconfirm --clean
 ```
 
-产物：`dist/NodeCodexSetup.exe`（约 41 MB，单文件免安装）
+产物：`src/dist/NodeCodexSetup.exe`（约 54 MB，单文件免安装），
+部署时复制为 `Codex小帮手.exe`。
 
 ## 技术要点
 
