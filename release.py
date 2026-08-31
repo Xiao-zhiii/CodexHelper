@@ -99,10 +99,20 @@ print(f"  {TAG} 可用")
 # ------------------------------------------------------- 4. 门禁 ----
 step("4. 发布前自检（preflight_check.py）")
 r = run([sys.executable, "preflight_check.py"])
-print((r.stdout or "").strip()[-1500:])
+pre_out = (r.stdout or "")
+print(pre_out.strip()[-1500:])
 if r.returncode != 0:
     die("发布前自检未通过")
 print("\n  自检通过")
+
+# 从输出里取出真实项数（"发布前自检：全部 N 项通过"）。
+# 曾经在 notes 里硬编码"20 项"，加了发布链路校验后变成 28 项，
+# notes 却还在说 20——写死的静态描述一定会过时。
+PREFLIGHT_COUNT = 0
+m = re.search(r"全部\s*(\d+)\s*项通过", pre_out)
+if m:
+    PREFLIGHT_COUNT = int(m.group(1))
+    print(f"  自检项数：{PREFLIGHT_COUNT}")
 
 # ------------------------------------------------------- 5. 打包 ----
 step("5. 打包 EXE")
@@ -160,7 +170,7 @@ notes += [
     f"|---|---|",
     f"| 文件大小 | {DIST_EXE.stat().st_size:,} 字节 |",
     f"| 打包时间 | {time.strftime('%Y-%m-%d %H:%M:%S')} |",
-    f"| 自检 | preflight_check.py 20 项全绿 |",
+    f"| 自检 | preflight_check.py {PREFLIGHT_COUNT} 项全绿 |",
 ]
 notes_text = "\n".join(notes)
 print(notes_text)
