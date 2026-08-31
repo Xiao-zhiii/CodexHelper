@@ -36,6 +36,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .. import logs
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
@@ -90,53 +92,26 @@ CATEGORY_LABELS = {
 }
 
 
+# 日志统一迁移到 logs.py（持久化到 %LOCALAPPDATA%\CodexHelper\，
+# 带 10MB×5 轮转、模块名、行号、异常 traceback）。
+# 为向后兼容，cfgcenter 仍暴露同名函数，内部转发给 logs 模块。
+
 def app_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
 
 
-LOG_PATH = app_directory() / "Codex Helper.log"
-
-
 def redact_log_value(value: Any, key_path: str = "") -> Any:
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            path = f"{key_path}.{key}" if key_path else str(key)
-            result[key] = redact_log_value(item, path)
-        return result
-    if isinstance(value, list):
-        return [redact_log_value(item, key_path) for item in value]
-    if key_path and is_sensitive_key(key_path):
-        return "***"
-    return value
+    return logs.redact(value, key_path)
 
 
 def write_log(level: str, message: str, **details: Any) -> None:
-    entry = {
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "level": level.upper(),
-        "message": message,
-        "details": redact_log_value(details),
-    }
-    try:
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        return
+    logs.write(level, message, **details)
 
 
 def write_exception_log(message: str, exc: BaseException, **details: Any) -> None:
-    write_log(
-        "ERROR",
-        message,
-        error_code=type(exc).__name__,
-        error=str(exc),
-        traceback=traceback.format_exc(),
-        **details,
-    )
+    logs.exception(message, exc, **details)
 
 
 @dataclass
@@ -2442,7 +2417,7 @@ def build_snapshot(query: dict[str, list[str]]) -> dict[str, Any]:
             "codex": str(discovery.codex_folder) if discovery.codex_folder else "",
             "ccSwitch": str(discovery.cc_switch_folder) if discovery.cc_switch_folder else "",
             "codexPlus": str(discovery.codex_plus_folder) if discovery.codex_plus_folder else "",
-            "log": str(LOG_PATH),
+            "log": str(logs.get_log_path()),
             "codexCandidates": [str(path) for path in discovery.codex_candidates],
             "ccSwitchCandidates": [str(path) for path in discovery.cc_switch_candidates],
             "codexPlusCandidates": [str(path) for path in discovery.codex_plus_candidates],

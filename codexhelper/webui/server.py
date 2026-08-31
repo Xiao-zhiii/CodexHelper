@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import cfgcenter, page
-from .. import codexhistory, codexlogs, codexpaths
+from .. import codexhistory, codexlogs, codexpaths, logs
 from ..constants import APP_TITLE, APP_VENDOR, APP_VERSION
 from ..gpt_fix import find_codex_desktop
 from ..installer import Installer
@@ -106,15 +106,22 @@ def _pump(job: _Job, q: queue.Queue):
         kind = msg[0]
         if kind == "log":
             _, tag, text = msg
-            job.logs.append({"tag": tag, "text": str(text),
-                             "t": time.strftime("%H:%M:%S")})
+            entry = {"tag": tag, "text": str(text),
+                     "t": time.strftime("%H:%M:%S")}
+            job.logs.append(entry)
+            # 同时持久化到任务专属日志，方便 AI/用户事后查看完整过程
+            logs.write_task_log(job.id, tag, text)
         elif kind == "status":
             job.status_text = msg[1]
+            # status 也落任务日志，确保 detect 这种不发 log 的任务也有迹可循
+            logs.write_task_log(job.id, "status", msg[1])
         elif kind == "progress":
             job.progress = None if msg[1] is None else max(0.0, min(1.0, msg[1]))
         elif kind == "done":
             _, ok, summary = msg
             job.ok, job.summary, job.status = bool(ok), summary, "done"
+            logs.write_task_log(job.id, "done",
+                                f"{'完成' if ok else '失败'}：{summary}")
         elif kind == "info":
             job.result["info"] = msg[1]
             _LAST_DETECT = {"info": msg[1], "gpt": job.result.get("gpt") or {}}
@@ -133,6 +140,7 @@ def _pump(job: _Job, q: queue.Queue):
         elif kind == "fix_manual":
             job.logs.append({"tag": "warn", "text": "未能自动键入修复指令：请到 Codex 窗口"
                              "【鼠标右键】粘贴提示词并回车（勿按 Ctrl+V）。", "t": ""})
+            logs.write_task_log(job.id, "warn", job.logs[-1]["text"])
 
 
 def start_job(action: str, params: dict) -> tuple[str | None, str]:
@@ -153,11 +161,21 @@ def start_job(action: str, params: dict) -> tuple[str | None, str]:
 
     target = _ACTION_TARGETS.get(action)
     if target is None:
-        job.status, job.summary = "done", False
-        job.ok, job.summary = False, f"未知任务类型：{action}"
-        return job_id, ""
+        # 未知 action 也走完整队列流程，确保任务日志/状态一致，便于 AI 排查
+        q.put(("log", "warn", f"未知任务类型：{action}"))
+        q.put(("done", False, f"未知任务类型：{action}"))
+
+    # 内存中最多保留 50 个已完成任务，避免长期运行后无限增长
+    with _JOBS_LOCK:
+        done_jobs = [j for j in _JOBS.values() if j.status != "running"]
+        if len(done_jobs) > 50:
+            done_jobs.sort(key=lambda j: j.created)
+            for old in done_jobs[:len(done_jobs) - 50]:
+                _JOBS.pop(old.id, None)
 
     def run():
+        if target is None:
+            return
         try:
             target(worker, job, params or {})
         except Exception as exc:  # noqa: BLE001 - 任务异常进日志
@@ -327,6 +345,7 @@ class CHServer(ThreadingHTTPServer):
         self.last_seen = time.time()
         self.first_seen = None     # 浏览器首次请求时间（空闲退出从它起算）
         self.boot_time = time.time()
+        self.pid = os.getpid()
         self.url = ""              # 启动器填入，供重试打开页面
 
 
@@ -454,9 +473,37 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json(codexlogs.summary())
                 return
             if parsed.path == "/api/helper-log":
-                self.send_json(codexlogs.read_helper_log(
-                    tail_lines=int(parse_qs(parsed.query)
-                                   .get("lines", ["300"])[0])))
+                q = parse_qs(parsed.query)
+                # 默认保持旧行为：返回纯文本 tail
+                # 带 format=structured 时返回结构化 JSON（AI 友好）
+                if q.get("format", ["text"])[0] == "structured":
+                    self.send_json(logs.tail(
+                        lines=int(q.get("lines", ["300"])[0]),
+                        level=q.get("level", [""])[0],
+                        keyword=q.get("keyword", [""])[0],
+                        offset=int(q.get("offset", ["0"])[0])))
+                else:
+                    self.send_json(codexlogs.read_helper_log(
+                        tail_lines=int(q.get("lines", ["300"])[0])))
+                return
+            # ---- helper 诊断接口：供 AI/排查随时查看运行状态 ----
+            if parsed.path == "/api/helper-status":
+                self.send_json(_build_helper_status(self.server))
+                return
+            if parsed.path == "/api/helper-tasks":
+                self.send_json(_build_helper_tasks())
+                return
+            if parsed.path == "/api/helper-task-log":
+                job_id = parse_qs(parsed.query).get("id", [""])[0]
+                lines = int(parse_qs(parsed.query).get("lines", ["200"])[0])
+                self.send_json(logs.tail_task_log(job_id, lines))
+                return
+            if parsed.path == "/api/helper-client-errors":
+                q = parse_qs(parsed.query)
+                self.send_json(logs.tail_client_errors(
+                    lines=int(q.get("lines", ["100"])[0]),
+                    keyword=q.get("keyword", [""])[0],
+                    offset=int(q.get("offset", ["0"])[0])))
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
         except (ConnectionResetError, BrokenPipeError):
@@ -496,6 +543,29 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/cancel":
                 ok = cancel_job(self.read_json_body().get("id", ""))
                 self.send_json({"ok": True, "cancelled": ok})
+                return
+            # 前端异常上报。页面 JS 出错时后端一切正常，日志里不会有痕迹，
+            # 排查"卡片全空白"这类问题全靠它——故单独开一个端点落到本程序日志。
+            if parsed.path == "/api/client-error":
+                body = self.read_json_body() or {}
+                # 前端异常单独落到 client-errors.log，方便与后端日志分流排查
+                logs.client_error(
+                    str(body.get("message") or "未知错误"),
+                    kind=str(body.get("kind") or "onerror"),
+                    source=str(body.get("source") or ""),
+                    line=body.get("line"),
+                    column=body.get("column"),
+                    stack=str(body.get("stack") or "")[:3000],
+                )
+                # 同时在主日志留一条摘要，避免只看主日志时完全不知道前端异常
+                cfgcenter.write_log(
+                    "WARN",
+                    "前端异常已记录到 client-errors.log",
+                    kind=str(body.get("kind") or "onerror"),
+                    source=str(body.get("source") or ""),
+                    line=body.get("line"),
+                )
+                self.send_json({"ok": True})
                 return
             if parsed.path == "/api/relaunch-admin":
                 self.send_json({"ok": True})
@@ -540,6 +610,82 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.server.shutdown()
         # 兜底：若窗口销毁在 GUI 线程侧未及时生效，2.5 秒后强制退出进程
         threading.Timer(2.5, lambda: os._exit(0)).start()
+
+
+def _job_summary(job: _Job) -> dict:
+    """给 helper-status / helper-tasks 用的任务摘要。"""
+    return {
+        "id": job.id,
+        "action": job.action,
+        "status": job.status,
+        "ok": job.ok,
+        "summary": job.summary,
+        "progress": job.progress,
+        "statusText": job.status_text,
+        "created": job.created,
+        "finished": job.created if job.status != "running" else None,
+        "log_tail": [l["text"] for l in job.logs[-6:]],
+        "log_count": len(job.logs),
+    }
+
+
+def _build_helper_tasks() -> dict:
+    """返回所有任务（内存中）的摘要列表，按创建时间倒序。"""
+    with _JOBS_LOCK:
+        items = sorted(_JOBS.values(), key=lambda j: j.created, reverse=True)
+        return {"ok": True, "count": len(items),
+                "tasks": [_job_summary(j) for j in items]}
+
+
+def _build_helper_status(server: CHServer) -> dict:
+    """聚合当前运行状态，供 AI 一键排查"卡在何处"。"""
+    now = time.time()
+    home = codexpaths.resolve_codex_home()
+    log_dir = logs.get_log_dir()
+    main_log = logs.get_log_path()
+    client_err = log_dir / "client-errors.log"
+
+    with _JOBS_LOCK:
+        running = [j for j in _JOBS.values() if j.status == "running"]
+        current = _job_summary(running[0]) if running else None
+        recent = sorted(
+            [j for j in _JOBS.values() if j.status != "running"],
+            key=lambda j: j.created, reverse=True)[:20]
+
+    return {
+        "ok": True,
+        "app": APP_TITLE,
+        "version": APP_VERSION,
+        "vendor": APP_VENDOR,
+        "pid": getattr(server, "pid", os.getpid()),
+        "port": server.server_address[1],
+        "admin": is_admin(),
+        "boot_time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                     time.localtime(getattr(server, "boot_time", now))),
+        "uptime_sec": int(now - getattr(server, "boot_time", now)),
+        "first_seen": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(server.first_seen))
+                       if server.first_seen else None),
+        "last_seen": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(server.last_seen))
+                      if server.last_seen else None),
+        "idle_sec": int(now - server.last_seen) if server.last_seen else 0,
+        "homepage": _homepage(),
+        "proxy": detect_proxy(),
+        "codex_home": str(home) if home else None,
+        "detect": _LAST_DETECT,
+        "appx": _LAST_APPX[0],
+        "pusher_enabled": _PUSHER[0] is not None,
+        "current_task": current,
+        "recent_tasks": [_job_summary(j) for j in recent],
+        "logs": {
+            "main": {"path": str(main_log),
+                     "size": main_log.stat().st_size if main_log.is_file() else 0},
+            "client_errors": {"path": str(client_err),
+                              "size": client_err.stat().st_size
+                              if client_err.is_file() else 0},
+        },
+    }
 
 
 def _homepage() -> str:

@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import codexpaths
+from . import codexpaths, logs
 from .util import res_path
 
 # 返回给前端的单条正文截断长度
@@ -245,9 +245,13 @@ def export_logs(dest: str, levels: list[str] | None = None,
 def helper_log_path() -> str | None:
     """本程序（Codex 小帮手）自身的运行日志。
 
-    位于 exe / 脚本旁边，记录启动每一步（服务/浏览器/窗口），
-    排障时优先看它——这一点在交接文档 §7 有说明。
+    优先使用 logs 模块的持久化位置（%LOCALAPPDATA%\\CodexHelper\\），
+    找不到时回退 exe / 脚本旁边的旧位置，保证 onefile 与脚本模式都能读到。
     """
+    new = logs.get_log_path()
+    if new.is_file():
+        return str(new)
+    # 兼容旧位置：脚本模式或历史日志
     p = res_path("Codex Helper.log")
     if p:
         return p
@@ -261,7 +265,7 @@ def helper_log_path() -> str | None:
 
 
 def read_helper_log(tail_lines: int = 300) -> dict:
-    """读本程序自身日志的末尾若干行。"""
+    """读本程序自身日志的末尾若干行（返回纯文本，保留历史格式）。"""
     p = helper_log_path()
     if not p or not os.path.isfile(p):
         return {"ok": False, "error": "未找到本程序日志（Codex Helper.log）",

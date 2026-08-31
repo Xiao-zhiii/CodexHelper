@@ -340,6 +340,55 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     # ---------- ⑤ 任务系统 JS（注入到 </script> 前）----------
     js = """
+    /* ==================== 全局错误兜底（必须最先注册）====================
+       页面 JS 一旦抛错，整段 script 会中断，所有渲染静默失效——
+       表现就是"卡片全空白"，而后端日志干干净净，极难定位。
+       因此这里把异常同时送到三处：后端日志、页面日志面板、可见横幅。 */
+    (function () {
+      function report(msg, kind, extra) {
+        try {
+          fetch("/api/client-error", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(Object.assign({
+              message: String(msg || "未知错误").slice(0, 500),
+              kind: kind || "onerror"
+            }, extra || {}))
+          }).catch(function () {});
+        } catch (e) {}
+        try {
+          var box = document.getElementById("taskLog");
+          if (box) {
+            var line = document.createElement("div");
+            line.textContent = "[" + (kind || "error") + "] " + msg;
+            line.style.color = "var(--danger)";
+            box.appendChild(line);
+          }
+        } catch (e) {}
+      }
+
+      window.addEventListener("error", function (event) {
+        var t = event.target;
+        // 资源加载失败（img/script）不带 error 对象，单独处理
+        if (t && t !== window && t.tagName) {
+          report("资源加载失败：" + (t.src || t.href || t.tagName), "resource");
+          return;
+        }
+        report(event.message, "onerror", {
+          source: event.filename, line: event.lineno,
+          column: event.colno,
+          stack: event.error && event.error.stack ? event.error.stack : ""
+        });
+      }, true);
+
+      window.addEventListener("unhandledrejection", function (event) {
+        var r = event.reason || {};
+        report(r.message || String(r), "unhandledrejection", {
+          stack: r.stack || ""
+        });
+      });
+    })();
+
     /* ==================== Codex 小帮手 任务系统 ==================== */
     const CH = {
       logSeen: {},
@@ -802,24 +851,28 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       loadThreads();
     }
 
+    // 注意：下面 confirm/prompt 文案里的换行必须写成转义形式（反斜杠加 n）。
+    // 若误写成真实换行，JS 双引号字符串不能跨行，整个 script 块会抛
+    // SyntaxError 而停摆，页面所有渲染静默失效（表现为卡片全空白）。
+    // 改完务必跑 node --check 校验（见 _js_check.py）。
     $("#histArchiveBtn").addEventListener("click", () =>
-      histAction("archive_threads", "将 {n} 个会话归档？\n归档后会话文件移入 archived_sessions，"
+      histAction("archive_threads", "将 {n} 个会话归档？\\n归档后会话文件移入 archived_sessions，"
         + "Codex 列表里不再显示，可随时恢复。"));
     $("#histRestoreBtn").addEventListener("click", () =>
-      histAction("restore_threads", "恢复 {n} 个归档会话？\n会话文件将移回 sessions 目录。"));
+      histAction("restore_threads", "恢复 {n} 个归档会话？\\n会话文件将移回 sessions 目录。"));
     $("#histDeleteBtn").addEventListener("click", () =>
-      histAction("delete_threads", "确定删除 {n} 个会话？\n"
-        + "这会同时删除数据库记录和会话文件，不可撤销。\n"
+      histAction("delete_threads", "确定删除 {n} 个会话？\\n"
+        + "这会同时删除数据库记录和会话文件，不可撤销。\\n"
         + "操作前会自动备份数据库到 backups_state/codexhelper/。"));
     $("#importClaudeBtn").addEventListener("click", async () => {
-      if (!confirm("从 ~/.claude/projects 导入 Claude Code 会话？\n"
+      if (!confirm("从 ~/.claude/projects 导入 Claude Code 会话？\\n"
         + "会转换为 Codex 会话格式（仅迁移文本内容）。")) return;
       await startTask("import_claude", {});
       loadThreads();
     });
     $("#importCodexBtn").addEventListener("click", async () => {
       const src = prompt("输入另一个 Codex 数据目录（含 sessions 文件夹）：",
-        "C:\\Users\\你的用户名\\.codex");
+        "C:\\\\Users\\\\你的用户名\\\\.codex");
       if (!src) return;
       await startTask("import_codex", { src: src });
       loadThreads();

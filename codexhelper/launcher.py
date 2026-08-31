@@ -16,7 +16,7 @@ import urllib.request
 from .constants import APP_TITLE
 from .util import is_admin, relaunch_as_admin
 from .webui import cfgcenter
-from .webui.server import CHServer, RequestHandler
+from .webui.server import CHServer, RequestHandler, set_pusher
 
 BASE_PORTS = (17653, 17654, 17655)   # 避开 Windows 保留端口段（Hyper-V 会整段排除）
 IDLE_TIMEOUT_SEC = 45
@@ -185,90 +185,258 @@ def main() -> None:
         return
 
 
+# --------------------------------------------------------- 界面自检逻辑 ----
+# 需求：打开软件后先自检，有 WebView2 就用原生窗口，没有就降级 tkinter。
+# 降级链：WebView2 → tkinter → 浏览器 --app 模式。
+# 每一级降级原因都写进日志，避免"界面变了但不留痕迹"这种最难排查的情况。
+
+_WV2_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def _webview2_installed() -> bool:
+    """检测 WebView2 运行时是否已安装。
+
+    三个来源任一命中即认为可用：
+    1. 独立 WebView2 Runtime（注册表 EdgeUpdate\\Clients）
+    2. Edge 自带的 msedgewebview2.exe
+
+    非 Windows 平台不做检测，交回 pywebview 自己尝试。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import winreg
+    except ImportError:
+        return True
+
+    paths = tuple(
+        base + "\\" + _WV2_GUID for base in (
+            r"SOFTWARE\Microsoft\EdgeUpdate\Clients",
+            r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients",
+        ))
+    # 32/64 位视图都要看，运行时可能只装在其中一个
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for path in paths:
+            for view in (0, winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, path, 0, winreg.KEY_READ | view):
+                        return True
+                except OSError:
+                    continue
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        d = os.environ.get(env)
+        if d and (Path(d) / "Microsoft" / "Edge" / "Application"
+                  / "msedgewebview2.exe").is_file():
+            return True
+    return False
+
+
+def detect_webview_runtime() -> tuple[bool, str]:
+    """自检 WebView2 是否可用。返回 (可用, 不可用原因)。"""
+    try:
+        import webview  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return False, f"pywebview 未安装（{exc}）"
+    if not _webview2_installed():
+        return False, "未检测到 WebView2 运行时"
+    return True, ""
+
+
+def _release_server(server) -> None:
+    """降级时释放已绑定端口。
+
+    不释放的话，下次启动会走"已有实例"分支去唤起一个不存在的服务。
+    """
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
+
+
+def _start_webview() -> bool:
+    """启动 WebView2 原生窗口。正常退出时不会返回（os._exit）；失败返回 False。"""
+    try:
+        import webview
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"pywebview 导入失败：{exc}")
+        return False
+
+    server, url = _acquire_server()
+    if server is None:
+        return True          # 自检期间被其它实例抢先启动，视为已处理
+    server.url = url
+    _log_line(f"服务已启动：{url}（管理员={is_admin()}）")
+
+    if os.environ.get("CH_DEBUG"):
+        import logging
+        debug_log = os.path.join(os.environ.get("TEMP", "."), "ch_debug.log")
+        logging.basicConfig(
+            filename=debug_log, level=logging.DEBUG,
+            format="%(asctime)s %(name)s %(message)s")
+        _log_line("pywebview 调试日志 → " + debug_log)
+
+    try:
+        _log_line("正在创建 WebView2 原生窗口…")
+        window = webview.create_window(
+            APP_TITLE, url, width=1280, height=920, min_size=(980, 620))
+        _log_line("窗口已创建，进入消息循环…")
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"创建 WebView2 窗口失败：{exc}")
+        _release_server(server)
+        return False
+
+    # 关键：webview.start() 会阻塞主线程，HTTP 服务必须放进后台线程，
+    # 否则端口只监听不 accept，页面请求永远挂起（窗口一直转圈）
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # 推送器：Python 每秒把任务状态直接推进页面（evaluate_js），
+    # 不依赖页面定时器/轮询——WebView2 里它们可能被节流冻结
+    def _pusher(payload):
+        js = "window.__applyJob && window.__applyJob(" + \
+            json.dumps(payload, ensure_ascii=False) + ")"
+        try:
+            window.evaluate_js(js)
+        except Exception:
+            pass
+
+    try:
+        set_pusher(_pusher)
+        threading.Thread(target=monitor_idle, args=(server,),
+                         kwargs={"window_mode": "webview"},
+                         daemon=True).start()
+        webview.start(debug=bool(os.environ.get("CH_DEBUG")))
+    except Exception as exc:  # noqa: BLE001
+        set_pusher(None)
+        _log_line(f"WebView2 消息循环异常：{exc}")
+        _release_server(server)
+        return False
+
+    set_pusher(None)
+    _log_line("窗口已关闭，程序退出。")
+    server.shutdown()
+    server.server_close()
+    os._exit(0)   # WebView2 后台线程可能延迟退出，确保干净收尾
+
+
+def _start_tkinter(reason: str) -> bool:
+    """降级到 tkinter 界面。用户关掉窗口后返回 True；不可用返回 False。
+
+    已知降级：tkinter 界面只有 4 个分页（安装 / ChatGPT 修复 / 桌面端 /
+    环境检测），没有 WebView2 版的"历史管理""日志"等分页。
+    装上 WebView2 运行时后会自动恢复完整界面。
+
+    即使走 tkinter，仍在后台起本地服务（不打开浏览器），
+    这样 AI 依然能通过 /api/helper-status 等接口排查问题。
+    """
+    try:
+        import tkinter  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"tkinter 不可用：{exc}")
+        return False
+
+    server = None
+    try:
+        from .app import main as tk_main
+        server, url = _acquire_server()
+        if server is not None:
+            server.url = url
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            _log_line(f"tkinter 界面已就绪，后台服务仍监听 {url}（供 AI 排查）")
+        _log_line(f"启动 tkinter 界面（原因：{reason}）")
+        tk_main()
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"tkinter 界面启动失败：{exc}")
+        return False
+    finally:
+        if server is not None:
+            _release_server(server)
+    return True
+
+
+def _start_browser_mode() -> None:
+    """最终兜底：Edge/Chrome --app 模式。"""
+    server, url = _acquire_server()
+    if server is None:
+        # 已有实例在跑，唤起即可
+        threading.Timer(0.2, open_browser, args=(url,)).start()
+        return
+    server.url = url
+    _log_line(f"浏览器模式：服务已启动 {url}")
+    set_pusher(None)
+    threading.Thread(target=monitor_idle, args=(server,),
+                     kwargs={"window_mode": "browser"},
+                     daemon=True).start()
+    threading.Timer(0.3, open_browser, args=(url,)).start()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
 def _main_impl() -> None:
     args = sys.argv[1:]
     if "--self-test" in args:
         raise SystemExit(self_test())
     no_browser = "--no-browser" in args
+    # CH_WEB 可强制某种界面，便于排查：webview / tk / edge
+    force = os.environ.get("CH_WEB", "").strip().lower()
 
-    server, url = _acquire_server()
-    if server is None:
-        # 已有实例在跑：唤起页面即可
+    # ---- 单实例：已有实例在跑就唤起它 ----
+    existing = _running_instance_url()
+    if existing:
         if not no_browser:
-            threading.Timer(0.2, open_browser, args=(url,)).start()
+            threading.Timer(0.2, open_browser, args=(existing,)).start()
+        _log_line(f"已有实例在运行，唤起页面：{existing}")
         return
 
-    server.url = url
-    _log_line(f"服务已启动：{url}（管理员={is_admin()}）")
-
-    # 窗口方案：优先 pywebview（WebView2 原生内嵌窗口，CC Switch 同款观感）；
-    # 不可用时回退 Edge/Chrome --app 模式。CH_WEB=edge 可强制浏览器模式。
-    webview_ok = False
-    if not no_browser and os.environ.get("CH_WEB", "") != "edge":
-        webview = None
-        try:
-            import webview
-            _log_line("pywebview 导入成功。")
-        except Exception as exc:
-            _log_line(f"pywebview 不可用（{exc}），回退浏览器模式。")
-        if webview is not None:
-            if os.environ.get("CH_DEBUG"):
-                import logging
-                debug_log = os.path.join(os.environ.get("TEMP", "."),
-                                         "ch_debug.log")
-                logging.basicConfig(filename=debug_log, level=logging.DEBUG,
-                                    format="%(asctime)s %(name)s %(message)s")
-                _log_line("pywebview 调试日志 → " + debug_log)
-            try:
-                _log_line("正在创建 WebView2 原生窗口…")
-                window = webview.create_window(APP_TITLE, url, width=1280, height=920,
-                                               min_size=(980, 620))
-                _log_line("窗口已创建，进入消息循环…")
-                webview_ok = True
-                # 关键：webview.start() 会阻塞主线程，HTTP 服务必须放进后台线程，
-                # 否则端口只监听不 accept，页面请求永远挂起（窗口一直转圈）
-                threading.Thread(target=server.serve_forever, daemon=True).start()
-
-                # 推送器：Python 每秒把任务状态直接推进页面（evaluate_js），
-                # 不依赖页面定时器/轮询——WebView2 里它们可能被节流冻结
-                def _pusher(payload):
-                    js = "window.__applyJob && window.__applyJob(" + \
-                        json.dumps(payload, ensure_ascii=False) + ")"
-                    try:
-                        window.evaluate_js(js)
-                    except Exception:
-                        pass
-
-                from .webui.server import set_pusher
-                set_pusher(_pusher)
-
-                threading.Thread(target=monitor_idle, args=(server,),
-                                 kwargs={"window_mode": "webview"},
-                                 daemon=True).start()
-                webview.start(debug=bool(os.environ.get("CH_DEBUG")))
-                set_pusher(None)
-                _log_line("窗口已关闭，程序退出。")
-                server.shutdown()
-                server.server_close()
-                os._exit(0)   # WebView2 后台线程可能延迟退出，确保干净收尾
-                return
-            except Exception as exc:
-                from .webui.server import set_pusher
-                set_pusher(None)
-                _log_line(f"原生窗口启动失败（{exc}），回退浏览器模式。")
-
-    if not webview_ok:
-        from .webui.server import set_pusher
-        set_pusher(None)
-        threading.Thread(target=monitor_idle, args=(server,),
-                         kwargs={"window_mode": "browser"},
-                         daemon=True).start()
-        if not no_browser:
-            threading.Timer(0.3, open_browser, args=(url,)).start()
+    # ---- 只起服务不开窗口（AI 排查用）----
+    if no_browser:
+        server, url = _acquire_server()
+        if server is None:
+            return
+        server.url = url
+        _log_line(f"无窗口模式：服务已启动 {url}")
         try:
             server.serve_forever()
         finally:
             server.server_close()
+        return
+
+    # ---- 启动自检：决定用哪种界面 ----
+    wv_ok, wv_reason = detect_webview_runtime()
+    _log_line("界面自检：WebView2 "
+              + ("可用" if wv_ok else f"不可用（{wv_reason}）"))
+
+    # 降级原因必须准确：日志写错原因比不写更坑人——曾经把"用户手动指定 tk"
+    # 记成"WebView2 不可用"，排查时直接被带偏方向。
+    if wv_ok and force not in ("edge", "tk"):
+        # 返回 True 表示"已处理"（如自检期间被别的实例抢先启动）；
+        # 返回 False 表示启动失败，需要降级。
+        # 正常成功时 _start_webview 内部会 os._exit，根本不会返回到这里。
+        try:
+            handled = _start_webview()
+        except Exception as exc:  # noqa: BLE001
+            handled = False
+            _log_line(f"WebView2 启动异常：{exc}")
+        if handled:
+            return
+        tk_reason = "WebView2 启动失败，降级"
+        _log_line("WebView2 未成功接管，尝试降级…")
+    elif wv_ok:
+        tk_reason = f"已由 CH_WEB={force} 指定（非故障）"
+    else:
+        tk_reason = wv_reason
+
+    if force != "edge":
+        if _start_tkinter(tk_reason):
+            return
+        _log_line("tkinter 界面也不可用，回退浏览器模式。")
+
+    _start_browser_mode()
 
 
 def self_test() -> int:
@@ -298,6 +466,10 @@ def self_test() -> int:
                                     % server.server_address[1], timeout=10) as resp:
             state = json.loads(resp.read().decode("utf-8"))
             ok &= state["version"] and "is_admin" in state
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/helper-status"
+                                    % server.server_address[1], timeout=10) as resp:
+            hstatus = json.loads(resp.read().decode("utf-8"))
+            ok &= hstatus.get("ok") and hstatus.get("pid") and hstatus.get("port")
     finally:
         server.shutdown()
         server.server_close()
