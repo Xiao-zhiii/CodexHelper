@@ -77,10 +77,14 @@ def _render_tab_nav(groups=TAB_GROUPS, default_tab: str = "") -> str:
     结构：
         <div class="tabgroup">
           <span class="tabgroup-label">环境</span>
-          <button class="tab" data-tab="deps" role="tab" ...>
-          ...
+          <div class="tabgroup-tabs">
+            <button class="tab" data-tab="deps" role="tab" ...>
+            ...
+          </div>
         </div>
 
+    用 .tabgroup-label 明确标识类别，用 .tabgroup-tabs 包裹可点击页签，
+    让用户一眼看出"这是分类名，那里面才是可切换的选项"。
     单个分组时不渲染分组标题（避免"其它：系统信息"这种冗余）。
     """
     active = default_tab or _tab_active()
@@ -93,12 +97,14 @@ def _render_tab_nav(groups=TAB_GROUPS, default_tab: str = "") -> str:
         parts = []
         if show_label:
             parts.append(f'<span class="tabgroup-label">{gname}</span>')
+        buttons = []
         for tid, label in tabs:
             sel = "true" if tid == active else "false"
             act = " active" if tid == active else ""
-            parts.append(
+            buttons.append(
                 f'<button class="tab{act}" data-tab="{tid}" role="tab"'
                 f' aria-selected="{sel}" aria-controls="tab-{tid}">{label}</button>')
+        parts.append('<div class="tabgroup-tabs">' + "".join(buttons) + "</div>")
         out.append('<div class="tabgroup">' + "".join(parts) + "</div>")
     return "\n          " + "\n          ".join(out) + "\n          "
 
@@ -117,36 +123,55 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     /* ---- 分组页签导航 ---- */
     /* 功能变多后按域分组，避免页签挤成一长条 */
-    .tabgroup { display: flex; align-items: center; gap: var(--sp-1);
+    .tabgroup { display: inline-flex; align-items: center; gap: var(--sp-2);
                 flex-wrap: wrap; }
-    .tabgroup-label { font-size: var(--fs-12); font-weight: 600;
-                      color: var(--muted); margin-right: var(--sp-1);
-                      padding-right: var(--sp-1);
-                      border-right: 1px solid var(--line);
-                      white-space: nowrap; user-select: none; }
-    .tabgroup + .tabgroup { margin-left: var(--sp-2); }
+    /* 分组标题：做成 section header，明显区别于可点击的 tab */
+    .tabgroup-label {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: var(--fs-11); font-weight: 700;
+      color: var(--text-2);
+      text-transform: uppercase; letter-spacing: 0.08em;
+      white-space: nowrap; user-select: none;
+      padding: 2px 10px 2px 2px;
+      border-right: 1px solid var(--line-strong);
+    }
+    .tabgroup-label::before {
+      content: ""; width: 3px; height: 12px; border-radius: var(--r-xs);
+      background: var(--accent); opacity: 0.7;
+    }
+    .tabgroup-tabs { display: flex; align-items: center; gap: 2px;
+                     flex-wrap: wrap; }
+    .tabgroup + .tabgroup { margin-left: var(--sp-4); }
+
+    /* 页签紧凑化，同时强化 active 状态 */
+    .tabs { padding: 3px; gap: 2px; }
+    .tab { min-height: 26px; padding: 0 9px; font-size: var(--fs-12);
+           font-weight: 550; }
+    .tab.active { background: var(--accent); color: var(--accent-fg);
+                  border-color: var(--accent); font-weight: 650; }
+    .tab:hover:not(.active) { background: var(--surface-3); color: var(--text-2); }
 
     /* ---- 运行时依赖卡片 ---- */
     .dep-card { border: 1px solid var(--line); background: var(--surface);
-                border-radius: var(--r-sm); padding: var(--sp-3);
-                display: flex; flex-direction: column; gap: 6px; }
+                border-radius: var(--r-sm); padding: 12px;
+                display: flex; flex-direction: column; gap: 4px; }
     .dep-card.missing { border-color: var(--warn-line);
                         background: var(--warn-soft); }
     .dep-head { display: flex; align-items: center; gap: var(--sp-2); }
     .dep-name { font-weight: 600; font-size: var(--fs-13); }
     .dep-desc { font-size: var(--fs-12); color: var(--muted);
-                line-height: 1.5; }
+                line-height: 1.45; }
     .dep-where { font-size: var(--fs-11); color: var(--muted);
                  word-break: break-all; }
     .dep-actions { display: flex; gap: var(--sp-2); margin-top: 2px; }
     .dep-actions button { font-size: var(--fs-12); padding: 4px 10px; }
 
     /* 缺失项提示条（启动自动检测后弹出） */
-    .deps-alert { display: none; align-items: flex-start; gap: var(--sp-3);
+    .deps-alert { display: none; align-items: flex-start; gap: var(--sp-2);
       border: 1px solid var(--warn-line); background: var(--warn-soft);
       color: var(--warn); border-radius: var(--r-sm);
-      padding: var(--sp-3); margin-bottom: var(--sp-4);
-      font-size: var(--fs-13); line-height: 1.6; }
+      padding: var(--sp-2) var(--sp-3); margin-bottom: var(--sp-3);
+      font-size: var(--fs-13); line-height: 1.55; }
     .deps-alert.show { display: flex; }
     .deps-alert .deps-alert-text { flex: 1; }
     .deps-alert button { flex-shrink: 0; }
@@ -303,6 +328,30 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
                 white-space: pre-wrap; overflow-wrap: anywhere;
                 max-height: 7.5em; overflow: auto; }
     .log-more { color: var(--accent-dark); font-size: var(--fs-11); }
+
+    /* ---- 整体紧凑：减少默认 padding / gap / 空白 ---- */
+    .shell { padding: var(--sp-2); }
+    .layout { grid-template-columns: 260px minmax(0, 1fr); gap: var(--sp-2); }
+    .sidebar { padding: var(--sp-2); top: var(--sp-2);
+               max-height: calc(100vh - var(--sp-4)); }
+    .sidebar .field:last-child { margin-bottom: 0; }
+    .content { padding: var(--sp-2); min-height: auto; }
+    .content h2 { font-size: var(--fs-18); margin-bottom: var(--sp-1); }
+    .content h3 { font-size: var(--fs-16); margin-bottom: var(--sp-1); }
+    .content .note { margin-bottom: var(--sp-2); }
+    .kv { padding: 10px; border-radius: var(--r-sm); }
+    .field { gap: 3px; margin-bottom: var(--sp-2); }
+    .section-gap { margin-top: var(--sp-2); }
+    .btncol { margin: var(--sp-2) 0; }
+    .empty { padding: var(--sp-4) var(--sp-2); }
+    h2, h3, h4 { margin-top: 0; margin-bottom: var(--sp-1); }
+    p { margin-top: 0; margin-bottom: var(--sp-1); }
+    .dep-card { padding: 10px; gap: 3px; }
+    .banner { padding: var(--sp-1) var(--sp-2); margin-bottom: var(--sp-2); }
+    .deps-alert { padding: var(--sp-2); margin-bottom: var(--sp-2); }
+    .summary { gap: var(--sp-1); margin-bottom: var(--sp-2); }
+    .toolbar { margin-bottom: var(--sp-2); }
+    .panel { border-radius: var(--r-md); }
 
     @media (max-width: 900px) {
       .grid3, .grid2 { grid-template-columns: 1fr; }
