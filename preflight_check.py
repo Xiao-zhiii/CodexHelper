@@ -137,6 +137,7 @@ for name, script in (
     ("codexpaths / codexhistory / codexlogs 沙箱", "test_codex_modules_headless.py"),
     ("helper 诊断接口与持久化日志", "test_helper_api_headless.py"),
     ("启动自检与界面降级链", "test_launcher_fallback_headless.py"),
+    ("运行时依赖与前端导航", "test_deps_headless.py"),
 ):
     t = SRC / script
     if t.is_file():

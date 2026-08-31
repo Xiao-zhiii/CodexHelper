@@ -204,4 +204,4 @@ if r.returncode != 0:
     die("创建 Release 失败")
 
 print(f"\n发版完成：{TAG}")
-print(f"  https://github.com/Xiao-zhiii/NodeCodexSetup/releases/tag/{TAG}")
+print(f"  https://github.com/Xiao-zhiii/CodexHelper/releases/tag/{TAG}")

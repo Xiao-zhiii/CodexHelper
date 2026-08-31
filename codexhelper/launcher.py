@@ -411,6 +411,18 @@ def _main_impl() -> None:
     _log_line("界面自检：WebView2 "
               + ("可用" if wv_ok else f"不可用（{wv_reason}）"))
 
+    # 运行时依赖自检：结果写进日志，AI/用户排查时能直接看到缺什么，
+    # 不用再打开界面翻。缺失项由前端弹横幅提示安装。
+    dep_missing = []
+    try:
+        from . import deps as _deps
+        r = _deps.scan()
+        dep_missing = r.get("missing") or []
+        _log_line("依赖自检：" + ("全部就绪" if not dep_missing
+                                else "缺失 " + ",".join(dep_missing)))
+    except Exception as exc:  # noqa: BLE001
+        _log_line(f"依赖自检失败：{exc}")
+
     # 降级原因必须准确：日志写错原因比不写更坑人——曾经把"用户手动指定 tk"
     # 记成"WebView2 不可用"，排查时直接被带偏方向。
     if wv_ok and force not in ("edge", "tk"):
@@ -440,38 +452,119 @@ def _main_impl() -> None:
 
 
 def self_test() -> int:
+    """跑一遍核心接口自检。退出码 0=通过，1=失败。
+
+    ⚠ 关键：每步都要写日志。
+    程序是 GUI 模式（console=False），没有 stdout/stderr，
+    一旦只返回退出码而不落日志，失败时就是纯粹的 exit=1 无输出，
+    完全无法排查——曾经为此耗了很久才定位到是 snapshot 少一个字段。
+
+    每项单独 try/except：一项失败不影响其余项跑完，
+    日志里能一次看到全部问题，而不是修一个再跑一次。
+    """
     import json
+
+    failures: list[str] = []
+
+    def check(name: str, fn) -> None:
+        """执行单项检查，记录结果。异常算失败但不中断整体。"""
+        try:
+            if fn():
+                _log_line(f"自检 ✓ {name}")
+            else:
+                failures.append(name)
+                _log_line(f"自检 ✗ {name}：断言不成立")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(name)
+            _log_line(f"自检 ✗ {name}：{type(exc).__name__}: {exc}")
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         free_port = probe.getsockname()[1]
     server = _try_bind(free_port)
-    assert server is not None, "测试端口不可用"
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    if server is None:
+        _log_line(f"自检 ✗ 测试端口 {free_port} 不可用")
+        return 1
+
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     time.sleep(0.3)
-    ok = True
+    _log_line(f"自检开始（端口 {port}）")
+
+    def _get(path, timeout=10):
+        with urllib.request.urlopen(base + path, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+
+    def _ping():
+        return _get("/api/ping", 5)[0] == 200
+
+    def _page():
+        _, html = _get("/", 10)
+        # tab-deps 是 v1.8.0 起的默认首页；tab-install 仍存在但已非默认
+        if "Codex 小帮手" not in html:
+            _log_line("自检：页面缺少标题 'Codex 小帮手'")
+            return False
+        if "tab-deps" not in html:
+            _log_line("自检：页面缺少 tab-deps 页签")
+            return False
+        return True
+
+    def _snapshot():
+        _, raw = _get("/api/snapshot?sensitive=0", 60)
+        snap = json.loads(raw)
+        need = ("system", "config", "auth", "ccSwitch", "codexPlus")
+        miss = [k for k in need if k not in snap]
+        if miss:
+            _log_line(f"自检：snapshot 缺少字段 {miss}")
+            return False
+        return True
+
+    def _state():
+        _, raw = _get("/api/state", 10)
+        st = json.loads(raw)
+        if not st.get("version"):
+            _log_line("自检：/api/state 缺少 version")
+            return False
+        if "is_admin" not in st:
+            _log_line("自检：/api/state 缺少 is_admin")
+            return False
+        return True
+
+    def _helper_status():
+        _, raw = _get("/api/helper-status", 10)
+        h = json.loads(raw)
+        miss = [k for k in ("ok", "pid", "port") if not h.get(k)]
+        if miss:
+            _log_line(f"自检：helper-status 缺少 {miss}")
+            return False
+        return True
+
+    def _deps_scan():
+        _, raw = _get("/api/deps-scan", 60)
+        d = json.loads(raw)
+        if not d.get("ok"):
+            _log_line(f"自检：deps-scan 返回 ok=False（{d.get('error')}）")
+            return False
+        if not isinstance(d.get("items"), list):
+            _log_line("自检：deps-scan 的 items 不是列表")
+            return False
+        return True
+
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/ping" % server.server_address[1],
-                                    timeout=5) as resp:
-            ok &= resp.status == 200
-        with urllib.request.urlopen("http://127.0.0.1:%d/" % server.server_address[1],
-                                    timeout=10) as resp:
-            html = resp.read().decode("utf-8")
-            ok &= "Codex 小帮手" in html and "tab-install" in html
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/snapshot?sensitive=0"
-                                    % server.server_address[1], timeout=60) as resp:
-            snap = json.loads(resp.read().decode("utf-8"))
-            ok &= all(k in snap for k in ("system", "config", "auth", "ccSwitch", "codexPlus"))
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/state"
-                                    % server.server_address[1], timeout=10) as resp:
-            state = json.loads(resp.read().decode("utf-8"))
-            ok &= state["version"] and "is_admin" in state
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/helper-status"
-                                    % server.server_address[1], timeout=10) as resp:
-            hstatus = json.loads(resp.read().decode("utf-8"))
-            ok &= hstatus.get("ok") and hstatus.get("pid") and hstatus.get("port")
+        check("/api/ping", _ping)
+        check("页面渲染", _page)
+        check("配置快照", _snapshot)
+        check("运行状态", _state)
+        check("helper 诊断接口", _helper_status)
+        check("运行时依赖检测", _deps_scan)
     finally:
         server.shutdown()
         server.server_close()
-    return 0 if ok else 1
+
+    if failures:
+        _log_line(f"自检结束：{len(failures)} 项失败 —— " + "、".join(failures))
+        return 1
+    _log_line("自检结束：全部通过")
+    return 0
 

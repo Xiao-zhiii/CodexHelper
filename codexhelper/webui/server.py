@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import cfgcenter, page
 from .. import codexhistory, codexlogs, codexpaths, logs
+from .. import deps as codexhelper_deps
 from ..constants import APP_TITLE, APP_VENDOR, APP_VERSION
 from ..gpt_fix import find_codex_desktop
 from ..installer import Installer
@@ -316,8 +317,57 @@ def _t_export_logs(worker: Installer, job: _Job, params: dict):
     _finish(worker, job, res, "日志导出完成")
 
 
+# ------------------------------------------------------- 运行时依赖任务 ----
+
+def _t_deps_scan(worker: Installer, job: _Job, params: dict):
+    """扫描运行时依赖（WebView2 / Python Manager / VC++）。"""
+    force = bool(params.get("force"))
+    if force:
+        codexhelper_deps.invalidate_cache()
+    res = codexhelper_deps.scan(force=force)
+    worker.log(f"扫描完成：缺失 {len(res['missing'])} 项", "info")
+    _finish(worker, job, res,
+            "环境依赖全部就绪" if res["all_ok"] else "有依赖缺失")
+
+
+def _t_deps_install(worker: Installer, job: _Job, params: dict):
+    """安装运行时依赖。可传单个 id，或 ids 列表批量装。"""
+    ids = params.get("ids")
+    if not ids:
+        one = params.get("dep")
+        ids = [one] if one else []
+    if not ids:
+        worker.q.put(("done", False, "未指定要安装的依赖"))
+        return
+
+    results = []
+    for i, dep_id in enumerate(ids, 1):
+        if worker.check_cancel():
+            worker.q.put(("done", False, "已取消"))
+            return
+        worker.status(f"正在安装第 {i}/{len(ids)} 项：{dep_id}")
+        r = codexhelper_deps.install_dep(dep_id)
+        results.append(r)
+        worker.log(f"{dep_id}：{r.get('message')}",
+                   "ok" if r.get("ok") else "err")
+
+    failed = [r["dep"] for r in results if not r.get("ok")]
+    codexhelper_deps.invalidate_cache()
+    # 装完重新扫一次，前端直接拿最新状态渲染，省一次往返
+    res = {
+        "results": results,
+        "failed": failed,
+        "scan": codexhelper_deps.scan(force=True),
+    }
+    _finish(worker, job, bool(results) and not failed,
+            "依赖安装完成" if not failed else f"{len(failed)} 项安装失败")
+    job.result["deps"] = res
+
+
 _ACTION_TARGETS = {
     "detect": _t_detect,
+    "deps_scan": _t_deps_scan,
+    "deps_install": _t_deps_install,
     "install_all": lambda w, j, p: _t_install(w, j, {"node": True, "codex": True}),
     "install_node": lambda w, j, p: _t_install(w, j, {"node": True, "codex": False}),
     "install_codex": lambda w, j, p: _t_install(w, j, {"node": False, "codex": True}),
@@ -411,12 +461,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json(cfgcenter.build_snapshot(parse_qs(parsed.query)))
                 return
             if parsed.path == "/api/state":
+                # deps 一并下发：页面初始化原本就要拉 /api/state，
+                # 合并进去省一次往返，前端首屏就能渲染依赖卡片。
+                # 扫描有缓存（PowerShell 检测慢），不会拖慢首屏。
+                try:
+                    deps_state = codexhelper_deps.scan()
+                except Exception as exc:  # noqa: BLE001
+                    deps_state = {"ok": False, "error": str(exc),
+                                  "items": [], "missing": []}
                 self.send_json({
                     "app": APP_TITLE, "version": APP_VERSION, "vendor": APP_VENDOR,
                     "homepage": _homepage(), "is_admin": is_admin(),
                     "proxy": detect_proxy(),
                     "detect": _LAST_DETECT,
                     "push": _PUSHER[0] is not None,
+                    "deps": deps_state,
                 })
                 return
             if parsed.path == "/api/appx":
@@ -434,6 +493,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                                    HTTPStatus.NOT_FOUND)
                     return
                 self.send_json(job.to_dict())
+                return
+            # ---- 运行时依赖（v1.8.0）：WebView2 / Python Manager / VC++ ----
+            if parsed.path == "/api/deps-scan":
+                q = parse_qs(parsed.query)
+                force = q.get("force", ["0"])[0] == "1"
+                if force:
+                    codexhelper_deps.invalidate_cache()
+                self.send_json(codexhelper_deps.scan(force=force))
+                return
+            if parsed.path == "/api/deps-install":
+                # POST 单个依赖；多个用 ids 数组
+                body = self.read_json_body() or {}
+                ids = body.get("ids") or (
+                    [body["dep"]] if body.get("dep") else [])
+                if not ids:
+                    self.send_json({"ok": False, "error": "未指定依赖"},
+                                   HTTPStatus.BAD_REQUEST)
+                    return
+                job_id, _ = _start_job("deps_install", {"ids": ids})
+                self.send_json({"ok": True, "id": job_id})
                 return
             # ---- Codex 历史 / 日志（v1.7.0）----
             if parsed.path == "/api/codex-paths":

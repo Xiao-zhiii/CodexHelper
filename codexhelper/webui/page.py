@@ -1,18 +1,106 @@
 # -*- coding: utf-8 -*-
-"""Codex 小帮手 Web 前端（v1.6.0）。
+"""Codex 小帮手 Web 前端。
 
-以收编项目（cfgcenter.HTML_PAGE）的页面为基底做四类注入：
+以收编项目（cfgcenter.HTML_PAGE）的页面为基底做注入：
 ① 品牌与配色（主色换成小帮手蓝、标题/副标题/关于）
-② 三个新功能标签页（安装·修复 / 桌面端 升降级 / Codex 环境检测）
+② 功能页签（按分组组织的导航 + 对应 section）
 ③ 任务系统 JS（/api/task 轮询：按钮加载态、进度条、日志控制台）
-④ showTab 覆盖：九个标签页统一切换，支持 ?tab= 深链
-加载动效沿用交接文档清单：骨架微光、按钮加载态、determinate 进度条、Spinner。
+④ showTab 覆盖：统一切换，支持 ?tab= 深链
+
+## 导航结构
+
+功能按用途分成四组（见 TAB_GROUPS）：环境 / 安装 / 数据 / 其它。
+**新增功能时只改 TAB_GROUPS 这一处**，导航按钮会自动生成；
+对应的 `<section id="tab-xxx">` 仍需手写在 our_sections 里。
+
+分组导航相比平铺 tab 的好处：功能变多后仍可按域定位，
+而不是挤成一长条让用户横向找。
 """
 from . import cfgcenter
 
 VERSION = ""
 VENDOR = "小枳ai分享"
 HOMEPAGE = ""
+
+# ------------------------------------------------------- 导航分组定义 ----
+# 结构：(分组名, ((页签 id, 显示名), ...))
+# 第一个分组的第一个页签为默认激活项（也可由 default_tab 显式指定）。
+#
+# 分组原则：
+#   环境 —— 检测/诊断类（不改系统）
+#   安装 —— 会改动系统的操作（安装、修复、升降级）
+#   数据 —— Codex 产生的数据（会话、日志）
+#   其它 —— 收编项目的原生页签
+TAB_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("环境", (
+        ("deps", "运行时依赖"),
+        ("envscan", "Codex 环境"),
+    )),
+    ("安装", (
+        ("install", "安装 · 修复"),
+        ("appx", "桌面端"),
+    )),
+    ("数据", (
+        ("history", "历史记录"),
+        ("logs", "日志"),
+    )),
+    ("其它", (
+        ("system", "系统信息"),
+    )),
+)
+
+
+# 收编项目（cfgcenter）自带的原生页签。它们不在 TAB_GROUPS 里，
+# 但深链 ?tab=xxx 必须能跳转过去，所以一并纳入 CH_TABS。
+# "system" 已归入 TAB_GROUPS 的"其它"分组，这里不重复列。
+_NATIVE_TABS = ("config", "auth", "cc", "codexplus", "raw")
+
+
+def _all_tabs() -> list[str]:
+    """按顺序列出 TAB_GROUPS 中的全部页签 id。"""
+    return [tid for _, tabs in TAB_GROUPS for tid, _ in tabs]
+
+
+def _js_tabs() -> list[str]:
+    """给前端 CH_TABS 用的完整页签清单（分组页签 + 原生页签）。"""
+    return _all_tabs() + list(_NATIVE_TABS)
+
+
+def _tab_active() -> str:
+    """默认激活的页签：第一个分组的第一项。"""
+    return TAB_GROUPS[0][1][0][0]
+
+
+def _render_tab_nav(groups=TAB_GROUPS, default_tab: str = "") -> str:
+    """把分组结构渲染成带分组标题的页签导航 HTML。
+
+    结构：
+        <div class="tabgroup">
+          <span class="tabgroup-label">环境</span>
+          <button class="tab" data-tab="deps" role="tab" ...>
+          ...
+        </div>
+
+    单个分组时不渲染分组标题（避免"其它：系统信息"这种冗余）。
+    """
+    active = default_tab or _tab_active()
+    out = []
+    for gname, tabs in groups:
+        if not tabs:
+            continue
+        # 只有一个分组且只有一个页签时不必显示分组名
+        show_label = len(groups) > 1 or len(tabs) > 1
+        parts = []
+        if show_label:
+            parts.append(f'<span class="tabgroup-label">{gname}</span>')
+        for tid, label in tabs:
+            sel = "true" if tid == active else "false"
+            act = " active" if tid == active else ""
+            parts.append(
+                f'<button class="tab{act}" data-tab="{tid}" role="tab"'
+                f' aria-selected="{sel}" aria-controls="tab-{tid}">{label}</button>')
+        out.append('<div class="tabgroup">' + "".join(parts) + "</div>")
+    return "\n          " + "\n          ".join(out) + "\n          "
 
 
 def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str:
@@ -25,7 +113,43 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
     /* ---- 头部 ---- */
     .ver { font-size: var(--fs-12); color: var(--muted); font-weight: 600;
            margin-left: 6px; font-variant-numeric: tabular-nums; }
-    .tabs { flex-wrap: wrap; }
+    .tabs { flex-wrap: wrap; gap: var(--sp-2); }
+
+    /* ---- 分组页签导航 ---- */
+    /* 功能变多后按域分组，避免页签挤成一长条 */
+    .tabgroup { display: flex; align-items: center; gap: var(--sp-1);
+                flex-wrap: wrap; }
+    .tabgroup-label { font-size: var(--fs-12); font-weight: 600;
+                      color: var(--muted); margin-right: var(--sp-1);
+                      padding-right: var(--sp-1);
+                      border-right: 1px solid var(--line);
+                      white-space: nowrap; user-select: none; }
+    .tabgroup + .tabgroup { margin-left: var(--sp-2); }
+
+    /* ---- 运行时依赖卡片 ---- */
+    .dep-card { border: 1px solid var(--line); background: var(--surface);
+                border-radius: var(--r-sm); padding: var(--sp-3);
+                display: flex; flex-direction: column; gap: 6px; }
+    .dep-card.missing { border-color: var(--warn-line);
+                        background: var(--warn-soft); }
+    .dep-head { display: flex; align-items: center; gap: var(--sp-2); }
+    .dep-name { font-weight: 600; font-size: var(--fs-13); }
+    .dep-desc { font-size: var(--fs-12); color: var(--muted);
+                line-height: 1.5; }
+    .dep-where { font-size: var(--fs-11); color: var(--muted);
+                 word-break: break-all; }
+    .dep-actions { display: flex; gap: var(--sp-2); margin-top: 2px; }
+    .dep-actions button { font-size: var(--fs-12); padding: 4px 10px; }
+
+    /* 缺失项提示条（启动自动检测后弹出） */
+    .deps-alert { display: none; align-items: flex-start; gap: var(--sp-3);
+      border: 1px solid var(--warn-line); background: var(--warn-soft);
+      color: var(--warn); border-radius: var(--r-sm);
+      padding: var(--sp-3); margin-bottom: var(--sp-4);
+      font-size: var(--fs-13); line-height: 1.6; }
+    .deps-alert.show { display: flex; }
+    .deps-alert .deps-alert-text { flex: 1; }
+    .deps-alert button { flex-shrink: 0; }
 
     /* 权限徽章：既是状态显示，也是提权入口 */
     .adminbadge { border-color: var(--warn-line); background: var(--warn-soft);
@@ -206,35 +330,68 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
                         '<title>Codex 小帮手</title>\n'
                         '  <link rel="icon" href="/favicon.ico">')
 
-    # 管理员横幅（body 顶部，#shell 前）
+    # 管理员横幅 + 依赖缺失提示（body 顶部，#shell 前）
+    # 依赖横幅默认隐藏，启动自动检测后由 JS 决定是否显示
     banner = """
   <div class="shell"><div class="banner" id="adminBanner">
     <span>⚠ 当前未以管理员身份运行：安装 Node.js / 修改系统设置时可能需要单独授权。</span>
     <button id="elevateBtn">以管理员身份重启</button>
   </div></div>
+  <div class="shell"><div class="deps-alert" id="depsAlert">
+    <span class="deps-alert-text" id="depsAlertText"></span>
+    <button class="primary" id="depsAlertInstallBtn">立即安装</button>
+    <button id="depsAlertCloseBtn">稍后</button>
+  </div></div>
   <div class="shell" id="appShell">"""
     html = html.replace('  <div class="shell">\n    <header>', banner + "\n    <header>")
     html = html.replace('  </div>\n\n  <script>', "  </div>\n\n  <script>", 1)
 
-    # ---------- ③ 新标签页按钮 ----------
+    # ---------- ③ 新标签页按钮（分组导航） ----------
     # 与 cfgcenter 的标签栏保持一致的无障碍语义（role=tab / aria-selected）。
-    our_tabs = """<button class="tab active" data-tab="install" role="tab" aria-selected="true" aria-controls="tab-install">安装 · 修复</button>
-          <button class="tab" data-tab="appx" role="tab" aria-selected="false" aria-controls="tab-appx">桌面端 升降级</button>
-          <button class="tab" data-tab="envscan" role="tab" aria-selected="false" aria-controls="tab-envscan">Codex 环境检测</button>
-          <button class="tab" data-tab="history" role="tab" aria-selected="false" aria-controls="tab-history">历史记录</button>
-          <button class="tab" data-tab="logs" role="tab" aria-selected="false" aria-controls="tab-logs">日志</button>
-          """
+    #
+    # 分组结构：以后新增功能只需往 TAB_GROUPS 里加一项，
+    # 导航与页签的 HTML 会自动生成，不用再手改这段拼接逻辑。
+    # 每项为 (id, 显示名)，第一个分组的第一个页签默认激活。
+    our_tabs = _render_tab_nav(TAB_GROUPS, default_tab="deps")
     anchor_tab = ('<button class="tab active" data-tab="system" role="tab" '
                   'aria-selected="true" aria-controls="tab-system">系统信息</button>')
     assert anchor_tab in html, "system tab anchor missing"
-    # 小帮手自己的三个页签排在前面并默认激活，因此要把 system 的 active 让出去
-    html = html.replace(anchor_tab,
-                        our_tabs + '<button class="tab" data-tab="system" role="tab" '
-                        'aria-selected="false" aria-controls="tab-system">系统信息</button>')
+    # 小帮手的页签排在前面并默认激活，因此要把 system 的 active 让出去。
+    # system 归入"其它"分组，不再另外追加一个孤立的按钮。
+    html = html.replace(anchor_tab, our_tabs)
 
     # ---------- ④ 新标签页内容 ----------
+    # 注意两点：
+    # 1. 默认激活的 section 不要带 class="hidden"（与导航的默认激活项保持一致）
+    # 2. 收编项目的 tab-system 原本是默认激活项（无 hidden），
+    #    现在默认页签让给了 deps，必须把它显式置为 hidden，
+    #    否则开屏会同时显示两个 section（"系统信息"叠在"运行时依赖"下面）。
+    html = html.replace(
+        '<section id="tab-system" role="tabpanel" aria-label="系统信息"></section>',
+        '<section id="tab-system" class="hidden" role="tabpanel"'
+        ' aria-label="系统信息"></section>')
+
     our_sections = """
-          <section id="tab-install" role="tabpanel" aria-label="安装 · 修复">
+          <section id="tab-deps" role="tabpanel" aria-label="运行时依赖">
+            <h2 class="section-title">运行时依赖</h2>
+            <div class="note">程序依赖以下运行时组件。缺失时会自动提示安装；
+              已内置的组件可离线安装，无需联网。</div>
+            <div id="depsList" class="grid3" style="margin-top:10px">
+              <div class="skeleton" style="height:88px"></div>
+              <div class="skeleton" style="height:88px"></div>
+              <div class="skeleton" style="height:88px"></div>
+            </div>
+            <div class="toolbar section-gap">
+              <button id="depsRescanBtn">↻ 重新检测</button>
+              <span class="spacer"></span>
+              <button id="depsInstallMissingBtn" class="primary" disabled>
+                安装缺失项</button>
+            </div>
+            <div class="progress" id="depsProgress"><i></i></div>
+            <div class="progress-label" id="depsStatus">等待检测…</div>
+            <div class="console" id="depsLog" style="display:none">—</div>
+          </section>
+          <section id="tab-install" class="hidden" role="tabpanel" aria-label="安装 · 修复">
             <h2 class="section-title">环境检测</h2>
             <div id="installDetect" class="grid3">
               <div class="skeleton" style="height:52px"></div>
@@ -481,6 +638,16 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       if (res.report) renderEnvReport(res.report);
       if (res.releases) renderMirrorTable(res.releases);
 
+      // 依赖安装：同步状态到"运行时依赖"页（进度条在 install 页，这里补文字）
+      if (job.action === "deps_install") {
+        const ds = $("#depsStatus");
+        if (ds) {
+          ds.textContent = job.status === "running"
+            ? (job.statusText || "正在安装…")
+            : ((job.ok ? "✔ " : "⚠ ") + (job.summary || ""));
+        }
+      }
+
       // 进度条 / 状态文字
       if (typeof job.progress === "number") {
         setProgress("#taskProgress", job.progress,
@@ -509,9 +676,11 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       $("#taskStatus").textContent = (job.ok ? "✔ 已完成：" : "⚠ 已结束：") + (job.summary || "");
       appendLog("#taskLog", (job.ok ? "✔ " : "⚠ ") + (job.summary || ""), job.ok ? "ok" : "warn");
       onJobDone(job);
+      // 依赖装完重新扫描：安装会改变系统状态，缓存必须失效
+      if (job.action === "deps_install") loadDeps(true);
       // 只有非检测任务结束才自动刷新检测结果；
       // 否则 detect→完成→refreshDetect→detect… 会形成无限循环（按钮一直转圈）
-      if (job.action !== "detect") refreshDetect();
+      if (job.action !== "detect" && job.action !== "deps_install") refreshDetect();
       } catch (e) {
         window.__trace.push("applyErr: " + (e.message || e));
       }
@@ -541,6 +710,105 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       return `<div class="kv"><div class="k">${escapeHtml(name)}</div>
         <div class="v ${okFlag ? "ok-text" : "warn-text"}">${escapeHtml(okFlag ? (okText || "✓") : (badText || "✗"))}</div>
         ${value ? `<div class="k" style="margin-top:3px">${escapeHtml(value)}</div>` : ""}</div>`;
+    }
+
+    /* ---- 运行时依赖（环境检测） ---- */
+    // 状态存在 window.CH_DEPS，安装完后由 __applyJob 重新渲染
+    function renderDeps(deps) {
+      if (!deps || !deps.items) return;
+      window.CH_DEPS = deps;
+      const box = $("#depsList");
+      if (!box) return;
+      box.className = "grid3";
+      box.innerHTML = deps.items.map(d => {
+        const state = d.installed
+          ? '<span class="badge success">✓ 已安装</span>'
+          : (d.required
+             ? '<span class="badge danger">✗ 缺失（必需）</span>'
+             : '<span class="badge current">○ 未安装（可选）</span>');
+        const size = d.size ? (d.size / 1048576).toFixed(1) + " MB" : "";
+        const src = d.has_local
+          ? "内置 " + size
+          : (d.url ? "需联网下载" : "无安装包");
+        const btn = d.installed ? "" :
+          `<button data-dep="${escapeHtml(d.id)}" class="dep-install-btn">安装</button>`;
+        return `<div class="dep-card ${d.installed ? "" : "missing"}">
+          <div class="dep-head">
+            <span class="dep-name">${escapeHtml(d.name)}</span>${state}
+          </div>
+          <div class="dep-desc">${escapeHtml(d.desc)}</div>
+          <div class="dep-where">${d.installed
+            ? escapeHtml(d.where || "")
+            : escapeHtml(src)}</div>
+          <div class="dep-actions">${btn}</div>
+        </div>`;
+      }).join("");
+
+      // 缺失项批量安装按钮
+      const missing = (deps.missing || []);
+      const btnAll = $("#depsInstallMissingBtn");
+      if (btnAll) {
+        btnAll.disabled = missing.length === 0;
+        btnAll.textContent = missing.length
+          ? "安装缺失项（" + missing.length + "）"
+          : "全部就绪";
+      }
+      const st = $("#depsStatus");
+      if (st) {
+        st.textContent = deps.all_ok
+          ? "✔ 必需依赖全部就绪。"
+          : "⚠ 有必需依赖缺失，建议安装后再使用完整功能。";
+      }
+
+      // 单个安装按钮
+      box.querySelectorAll(".dep-install-btn").forEach(b => {
+        b.onclick = () => installDeps([b.dataset.dep]);
+      });
+
+      updateDepsAlert(deps);
+    }
+
+    // 顶部横幅：启动自动检测后，有缺失就提示
+    function updateDepsAlert(deps) {
+      const el = $("#depsAlert");
+      if (!el) return;
+      const missing = (deps.missing || []).map(id => {
+        const it = (deps.items || []).find(x => x.id === id);
+        return it ? it.name : id;
+      });
+      if (!missing.length) { el.className = "deps-alert"; return; }
+      $("#depsAlertText").textContent =
+        "检测到以下运行时组件未安装：" + missing.join("、") + "。缺失时部分功能不可用，是否现在安装？";
+      el.className = "deps-alert show";
+    }
+
+    async function loadDeps(force) {
+      try {
+        const r = await fetch("/api/deps-scan" + (force ? "?force=1" : ""));
+        const d = await r.json();
+        renderDeps(d);
+        return d;
+      } catch (e) {
+        const st = $("#depsStatus");
+        if (st) st.textContent = "依赖检测失败：" + (e.message || e);
+        return null;
+      }
+    }
+
+    // 装依赖走通用任务通道（进度条复用 #taskProgress），
+    // 完成后在 __applyJob 里重新扫描并渲染。
+    // 注意 startTask 签名就是 (action, params)，别多传选择器参数——
+    // 多的会被静默忽略，看起来没报错但进度显示在别的页签上。
+    async function installDeps(ids) {
+      if (!ids || !ids.length) return;
+      const st = $("#depsStatus");
+      if (st) st.textContent = "正在安装…";
+      try {
+        const id = await startTask("deps_install", { ids: ids });
+        if (!id && st) st.textContent = "启动安装失败";
+      } catch (e) {
+        if (st) st.textContent = "启动安装失败：" + (e.message || e);
+      }
     }
 
     function renderInstallDetect(info, gpt) {
@@ -657,9 +925,11 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       add("【CODEX_CLI_PATH】" + (report.cli_path || "（未设置）"), report.cli_path ? "ok" : "dim");
     }
 
-    /* ---- showTab 覆盖：十一个标签页 + 深链 ---- */
-    const CH_TABS = ["install", "appx", "envscan", "history", "logs",
-                     "system", "config", "auth", "cc", "codexplus", "raw"];
+    /* ---- showTab 覆盖：全部分页 + 深链 ---- */
+    // CH_TABS 由 Python 的 TAB_GROUPS 自动生成，新增功能改一处即可；
+    // 手写列表容易漏，漏掉的页签点了没反应（历史 bug）。
+    const CH_TABS = {{CH_TABS_JSON}};
+    const CH_DEFAULT_TAB = {{CH_DEFAULT_TAB_JSON}};
     const _origShowTab = showTab;
     showTab = function (name) {
       state.activeTab = name;
@@ -979,7 +1249,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       } catch (error) { /* 忽略 */ }
     }
 
-    // 切到历史 / 日志页时才首次加载，避免开屏就打两个大查询
+    // 切到某个页时才首次加载，避免开屏就打一堆大查询
     const _origShowTab2 = showTab;
     showTab = function (name) {
       _origShowTab2(name);
@@ -987,13 +1257,42 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       if (name === "logs" && !LOGS.loaded) {
         LOGS.loaded = true; loadLogs(false); loadHelperLog();
       }
+      if (name === "deps" && !DEPS.loaded) {
+        DEPS.loaded = true;
+        // /api/state 已带 deps，直接用，省一次往返
+        if (window.CH_DEPS) renderDeps(window.CH_DEPS); else loadDeps(false);
+      }
+    };
+
+    /* ---- 依赖页交互 ---- */
+    const DEPS = { loaded: false };
+    const depsRescan = $("#depsRescanBtn");
+    if (depsRescan) depsRescan.onclick = () => { loadDeps(true); };
+    const depsAll = $("#depsInstallMissingBtn");
+    if (depsAll) depsAll.onclick = () => {
+      const d = window.CH_DEPS;
+      if (d && d.missing && d.missing.length) installDeps(d.missing);
+    };
+    // 顶部横幅按钮
+    const alertInstall = $("#depsAlertInstallBtn");
+    if (alertInstall) alertInstall.onclick = () => {
+      const d = window.CH_DEPS;
+      if (d && d.missing && d.missing.length) {
+        $("#depsAlert").className = "deps-alert";
+        showTab("deps");
+        installDeps(d.missing);
+      }
+    };
+    const alertClose = $("#depsAlertCloseBtn");
+    if (alertClose) alertClose.onclick = () => {
+      $("#depsAlert").className = "deps-alert";
     };
 
     /* ---- 初始化 ---- */
     (async () => {
       // 深链切页最先执行（不等任何网络请求）
       const wanted = new URLSearchParams(location.search).get("tab");
-      showTab(CH_TABS.includes(wanted) ? wanted : "install");
+      showTab(CH_TABS.includes(wanted) ? wanted : CH_DEFAULT_TAB);
       try {
         const st = await apiState();
         CH.push = !!st.push;
@@ -1004,6 +1303,8 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         if (!st.is_admin) $("#adminBanner").classList.add("show");
         // 优先用服务端缓存即时渲染（配合 /api/appx?refresh=1 才会真正重新探测）
         if (st.detect && st.detect.info) renderInstallDetect(st.detect.info, st.detect.gpt || {});
+        // 运行时依赖：/api/state 已带，直接渲染并按需弹提示（启动自动检测）
+        if (st.deps) { renderDeps(st.deps); }
         const appx = await fetch("/api/appx").then(r => r.json());
         window.CH_INSTALLED = appx.version || null;
         renderAppxCurrent(appx.pkg);
@@ -1017,7 +1318,10 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 """
     js = (js.replace("{{VERSION_JSON}}", json_dumps(version))
             .replace("{{VENDOR_JSON}}", json_dumps(vendor))
-            .replace("{{HOMEPAGE_JSON}}", json_dumps(homepage)))
+            .replace("{{HOMEPAGE_JSON}}", json_dumps(homepage))
+            # 分页清单 + 默认页：由 TAB_GROUPS 自动导出，避免手写遗漏
+            .replace("{{CH_TABS_JSON}}", json_dumps(_js_tabs()))
+            .replace("{{CH_DEFAULT_TAB_JSON}}", json_dumps(_tab_active())))
     anchor = '    setInterval(() => fetch("/api/ping").catch(() => {}), 10000);'
     assert anchor in html, "ping anchor missing"
     html = html.replace(anchor, anchor + "\n" + js)
