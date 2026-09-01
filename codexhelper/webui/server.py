@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 from . import cfgcenter, page
 from .. import codexhistory, codexlogs, codexpaths, logs
 from .. import deps as codexhelper_deps
+from .. import uwp as codexhelper_uwp
 from ..constants import APP_TITLE, APP_VENDOR, APP_VERSION
 from ..gpt_fix import find_codex_desktop
 from ..installer import Installer
@@ -513,6 +514,31 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 job_id, _ = _start_job("deps_install", {"ids": ids})
                 self.send_json({"ok": True, "id": job_id})
+                return
+            # ---- UWP 回环豁免（v1.8.2）：Codex 桌面端 / 微软商店 ----
+            # 这两个接口刻意走同步而非任务通道：
+            # 豁免的增删就是一次 CheckNetIsolation 调用（毫秒级），
+            # 走任务队列反而要多一次轮询往返、还拿不到即时结果。
+            if parsed.path == "/api/uwp-scan":
+                self.send_json(codexhelper_uwp.scan())
+                return
+            if parsed.path == "/api/uwp-apply":
+                body = self.read_json_body() or {}
+                app_id = (body.get("id") or "").strip()
+                enable = bool(body.get("enable"))
+                if not app_id:
+                    self.send_json({"ok": False, "error": "未指定应用"},
+                                   HTTPStatus.BAD_REQUEST)
+                    return
+                res = codexhelper_uwp.set_exempt(app_id, enable)
+                # logs.write(level, message)：级别是字符串，消息要自己拼好
+                detail = res.get("error") or res.get("message") or ""
+                logs.write("WARNING" if not res.get("ok") else "INFO",
+                           "UWP 回环豁免 %s %s：%s"
+                           % (app_id, "开启" if enable else "关闭", detail))
+                # 失败也返回 200：错误内容放 body.error，前端直接展示。
+                # 用非 2xx 会让前端 fetch 直接抛异常，反而看不到具体原因。
+                self.send_json(res)
                 return
             # ---- Codex 历史 / 日志（v1.7.0）----
             if parsed.path == "/api/codex-paths":

@@ -35,6 +35,7 @@ TAB_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("环境", (
         ("deps", "运行时依赖"),
         ("envscan", "Codex 环境"),
+        ("uwp", "UWP 代理豁免"),
     )),
     ("安装", (
         ("install", "安装 · 修复"),
@@ -484,6 +485,23 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
             </div>
             <div class="console" id="envReport">等待检测…</div>
           </section>
+          <section id="tab-uwp" class="hidden" role="tabpanel" aria-label="UWP 代理豁免">
+            <h2 class="section-title">UWP 回环代理豁免</h2>
+            <div class="note">Windows 的 UWP 应用运行在 AppContainer 沙箱里，
+              <b>默认禁止连接 127.0.0.1</b>；而系统代理恰恰把流量导向本机，
+              于是出现「代理开着、浏览器正常，但 UWP 应用死活不走代理」的现象。
+              把应用加入<b>回环豁免</b>即可解决。修改此项需要管理员权限。</div>
+            <div id="uwpList" class="grid2" style="margin-top:10px">
+              <div class="skeleton" style="height:104px"></div>
+              <div class="skeleton" style="height:104px"></div>
+            </div>
+            <div class="toolbar section-gap">
+              <button id="uwpRefreshBtn">↻ 重新检测</button>
+              <span class="spacer"></span>
+              <span class="note" id="uwpHint"></span>
+            </div>
+            <div class="console" id="uwpLog" style="display:none">—</div>
+          </section>
           <section id="tab-history" class="hidden" role="tabpanel" aria-label="历史记录">
             <h2 class="section-title">Codex 历史对话</h2>
             <div class="note">读取 <code>state_5.sqlite</code> 的会话索引；改库前会自动备份到
@@ -857,6 +875,92 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         if (!id && st) st.textContent = "启动安装失败";
       } catch (e) {
         if (st) st.textContent = "启动安装失败：" + (e.message || e);
+      }
+    }
+
+    /* ---- UWP 回环代理豁免（v1.8.2）---- */
+    // 卡片样式沿用 dep-card：明暗模式、圆角、间距都已调好，
+    // 不必为两个应用再复制一份 CSS。
+    function renderUwp(data) {
+      if (!data || !data.items) return;
+      window.CH_UWP = data;
+      const box = $("#uwpList");
+      if (!box) return;
+      box.className = "grid2";
+      box.innerHTML = data.items.map(it => {
+        const state = !it.installed
+          ? '<span class="badge current">— 未安装</span>'
+          : (it.exempt
+             ? '<span class="badge success">✓ 已豁免</span>'
+             : '<span class="badge danger">✗ 未豁免</span>');
+        // 非管理员时禁用开关：点了也只会失败，不如提前说清楚
+        const btn = !it.installed ? "" :
+          `<button data-uwp="${escapeHtml(it.id)}" data-enable="${it.exempt ? "0" : "1"}"
+            class="uwp-toggle-btn"${data.admin ? "" : ' disabled title="需要管理员权限"'}>${
+            it.exempt ? "关闭豁免" : "开启豁免"}</button>`;
+        return `<div class="dep-card ${it.installed ? "" : "missing"}">
+          <div class="dep-head">
+            <span class="dep-name">${escapeHtml(it.name)}</span>${state}
+          </div>
+          <div class="dep-desc">${escapeHtml(it.desc)}</div>
+          <div class="dep-where">${it.installed
+            ? escapeHtml(it.package) : "未检测到该应用"}</div>
+          <div class="dep-actions">${btn}</div>
+        </div>`;
+      }).join("");
+
+      box.querySelectorAll(".uwp-toggle-btn").forEach(b => {
+        b.onclick = () => toggleUwp(b.dataset.uwp, b.dataset.enable === "1");
+      });
+
+      const hint = $("#uwpHint");
+      if (hint) {
+        hint.textContent = data.supported
+          ? (data.admin ? "共 " + data.exempted_count + " 个应用处于豁免列表"
+                        : "⚠ 当前非管理员，修改豁免需要以管理员身份重启")
+          : (data.error || "当前平台不支持");
+      }
+    }
+
+    async function loadUwp() {
+      try {
+        const r = await fetch("/api/uwp-scan");
+        const d = await r.json();
+        renderUwp(d);
+        return d;
+      } catch (e) {
+        const st = $("#uwpLog");
+        if (st) {
+          st.style.display = "block";
+          st.textContent = "检测失败：" + (e.message || e);
+        }
+        return null;
+      }
+    }
+
+    // 豁免是毫秒级操作，走同步接口而非任务通道，直接拿结果即时刷新卡片
+    async function toggleUwp(id, enable) {
+      const st = $("#uwpLog");
+      if (st) {
+        st.style.display = "block";
+        st.textContent = "正在" + (enable ? "开启" : "关闭") + "豁免…";
+      }
+      try {
+        const r = await fetch("/api/uwp-apply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: id, enable: enable })
+        });
+        const d = await r.json();
+        // 失败也会带回最新 scan，照常渲染，避免界面停在旧状态
+        if (d.scan) renderUwp(d.scan);
+        if (st) {
+          st.textContent = d.ok
+            ? "✔ " + (d.message || "操作完成")
+            : "✗ " + (d.error || d.message || "操作失败");
+        }
+      } catch (e) {
+        if (st) st.textContent = "✗ 请求失败：" + (e.message || e);
       }
     }
 
@@ -1311,7 +1415,13 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         // /api/state 已带 deps，直接用，省一次往返
         if (window.CH_DEPS) renderDeps(window.CH_DEPS); else loadDeps(false);
       }
+      if (name === "uwp" && !UWP.loaded) { UWP.loaded = true; loadUwp(); }
     };
+
+    /* ---- UWP 豁免页交互 ---- */
+    const UWP = { loaded: false };
+    const uwpRefresh = $("#uwpRefreshBtn");
+    if (uwpRefresh) uwpRefresh.onclick = () => { loadUwp(); };
 
     /* ---- 依赖页交互 ---- */
     const DEPS = { loaded: false };

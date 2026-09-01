@@ -13,7 +13,7 @@
 ; 4. deps 目录一起装进去，保证运行时提示能离线安装，不依赖网络。
 
 #define MyAppName "Codex 小帮手"
-#define MyAppVersion "1.8.1"
+#define MyAppVersion "1.8.2"
 #define MyAppPublisher "小枳ai分享"
 #define MyAppURL "https://github.com/Xiao-zhiii/CodexHelper"
 #define MyAppExeName "Codex小帮手.exe"
