@@ -181,7 +181,15 @@ def main() -> None:
             r.withdraw()
             messagebox.showerror(APP_TITLE + " 启动失败", err[-1500:])
         except Exception:
-            print(err, file=sys.stderr)
+            # GUI 程序（console=False）没有可见的 stdout/stderr，print 出去等于丢掉。
+            # 这里是"崩溃日志写不进、错误框也弹不出"的最后兜底，再不落日志
+            # 就真的什么线索都不剩了（--self-test 失败排查全靠它）。
+            try:
+                from .logs import write as _log_write
+                _log_write("ERROR", "启动失败：连错误对话框都无法弹出",
+                           traceback=err[-3000:])
+            except Exception:
+                pass
         return
 
 

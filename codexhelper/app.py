@@ -379,5 +379,11 @@ def main():
             r.withdraw()
             messagebox.showerror(APP_TITLE + " 启动失败", err[-1500:])
         except Exception:
-            import sys
-            print(err, file=sys.stderr)
+            # 同 launcher.py：GUI 程序没有可见的 stderr，print 等于丢掉。
+            # 崩溃兜底必须落到统一日志，否则排查时找不到任何线索。
+            try:
+                from .logs import write as _log_write
+                _log_write("ERROR", "tkinter 界面启动失败：错误框也弹不出来",
+                           traceback=err[-3000:])
+            except Exception:
+                pass

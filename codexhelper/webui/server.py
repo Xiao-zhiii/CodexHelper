@@ -15,10 +15,20 @@
     POST /api/shutdown        退出
 任务在后台线程运行（复用 installer.Installer 的队列协议），前端轮询 /api/task。
 同一时刻只允许一个任务（与原 tkinter 行为一致）。
+
+鉴权：
+    除 /、/index.html、/favicon.ico、/api/ping 外，所有 /api/* 均需携带
+    `X-CH-Token` 头（值来自 get_api_token()，页面渲染时注入到 JS）。
+    令牌随进程生成，并落到 %LOCALAPPDATA%\CodexHelper\token.txt
+    （与 port.txt 同目录、同生命周期），供外部排查命令读取；带 Origin 时还校验
+    其主机是否为 127.0.0.1 / localhost / ::1。
+    理由：端口写在 port.txt，本机任意进程都能直达端点，"端口随机"不是防线。
 """
 import json
 import os
 import queue
+import secrets
+import subprocess
 import threading
 import time
 
@@ -37,6 +47,85 @@ from ..netenv import detect_proxy
 from ..util import is_admin, relaunch_as_admin
 
 SERVER_BRAND = "CodexHelper/1.6"
+
+# --------------------------------------------------------- 访问令牌（鉴权）----
+# 服务绑在 127.0.0.1，但端口写在 %LOCALAPPDATA%\CodexHelper\port.txt，
+# 本机任意进程（含浏览器里打开的任意网页）都能直达这 28 个端点——
+# 其中 /api/shutdown、/api/repair-codex、/api/codex-threads（删会话）、
+# /api/deps-install（装软件）都是危险写操作。
+# 因此除页面与心跳外，一律校验一次性随机令牌：
+#   · 令牌随进程启动生成，页面渲染时注入到 JS（见 page._build_html 的
+#     window.CH_TOKEN），同源页面才拿得到；
+#   · 跨域脚本读不到本服务的 HTML，令牌就带不出来；
+#   · 同时落到 logs.LOG_DIR/token.txt（见下 _persist_token）。
+#
+# 为什么落盘（交接文档 §12.13.3 三选一，本轮选 a）：
+#   不落盘的话 §七 那套外部排查命令（AI 直接查 helper-status / helper-log）
+#   全部 401——那是本项目"AI 友好"的核心能力，为防一个本来就挡不住的威胁
+#   （本机恶意进程能从内存里读到同一个令牌）而废掉它，代价不对等。
+#   落盘位置 %LOCALAPPDATA% 本身是用户级目录，同一台机器上的其他标准用户
+#   默认进不来；浏览器跨站仍由上面的 Origin 白名单挡住。
+_API_TOKEN = secrets.token_urlsafe(32)
+
+# 令牌文件与 port.txt 同目录：外部命令读 port.txt 拿端口，读 token.txt 拿令牌。
+TOKEN_FILE = logs.LOG_DIR / "token.txt"
+
+
+def _harden_token_file() -> None:
+    """尽力把 token.txt 收紧为仅当前用户可读写。失败不阻塞主流程。
+
+    注意必须给 W：下次启动要覆盖写这个文件，只给 R 会让自己下一个版本
+    写不进去（token.txt 停在旧令牌，外部命令全部 401）。
+    """
+    user = os.environ.get("USERNAME") or ""
+    domain = os.environ.get("USERDOMAIN") or ""
+    acct = f"{domain}\\{user}" if domain and user else user
+    if not acct:
+        return
+    try:
+        subprocess.run(
+            ["icacls", str(TOKEN_FILE), "/inheritance:r", "/grant:r",
+             f"{acct}:(R,W)"],
+            capture_output=True, timeout=10, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+def _persist_token(token: str) -> None:
+    """把令牌写入 %LOCALAPPDATA%\\CodexHelper\\token.txt（每次启动覆盖）。
+
+    写失败只记 WARN：不影响界面本身，只是外部命令取不到令牌。
+    """
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # 先删再写：老版本把自己收紧成只读后，直接覆盖写会 PermissionError。
+        TOKEN_FILE.unlink(missing_ok=True)
+        TOKEN_FILE.write_text(token, encoding="utf-8")
+        _harden_token_file()
+    except Exception as exc:  # pragma: no cover - 只在异常环境触发
+        logs.write("WARN", "访问令牌落盘失败，外部排查命令将取不到令牌",
+                   error=repr(exc))
+
+
+_persist_token(_API_TOKEN)
+
+# 这些端点不校验令牌：
+#   / /index.html —— 页面本身就是令牌下发处，拦了就打不开界面
+#   /favicon.ico  —— 静态图标，无副作用
+#   /api/ping     —— 单实例检测（launcher 用它判断"是不是我们的实例"）
+_PUBLIC_PATHS = frozenset({"/", "/index.html", "/favicon.ico", "/api/ping"})
+
+
+def get_api_token() -> str:
+    """返回本次进程的一次性 API 令牌，供页面渲染时注入。"""
+    return _API_TOKEN
+
+
+# 页面渲染时把令牌写进 window.CH_TOKEN，同源页面才带得上（见 page._build_html）。
+# 放在这里而不是请求处理里：令牌整个进程不变，写一次即可，也避免每请求赋值。
+page.API_TOKEN = _API_TOKEN
 
 # ------------------------------------------------------------- 任务系统 ----
 
@@ -434,6 +523,37 @@ class RequestHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    # ---- 鉴权 ----
+    def _check_auth(self, path: str) -> bool:
+        """校验访问令牌，失败时已自行回 401，调用方只需 `if not ...: return`。"""
+        if path in _PUBLIC_PATHS:
+            return True
+
+        # 1) 令牌：定长比较，避免逐字节短路泄露时序信息
+        given = self.headers.get("X-CH-Token") or ""
+        if not secrets.compare_digest(given, _API_TOKEN):
+            logs.write("WARN", "API 访问被拒：令牌缺失或不匹配",
+                       path=path, peer=self.client_address[0])
+            self.send_json({"ok": False, "errors": ["缺少或无效的访问令牌"]},
+                           HTTPStatus.UNAUTHORIZED)
+            return False
+
+        # 2) Origin：浏览器跨站请求会带 Origin。本服务的页面只可能来自
+        #    127.0.0.1 / localhost 的同源上下文，其它来源一律拒绝。
+        #    注意 origin 为 "null"（file:// 或隐私上下文）时放行——
+        #    pywebview 在某些降级路径下会给出 null，拒了会误伤自己。
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and origin.lower() != "null":
+            host = urlparse(origin).hostname or ""
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                logs.write("WARN", "API 访问被拒：Origin 不在白名单",
+                           path=path, origin=origin)
+                self.send_json({"ok": False, "errors": ["不允许的跨域来源"]},
+                               HTTPStatus.FORBIDDEN)
+                return False
+
+        return True
+
     # ---- GET ----
     def do_GET(self):
         try:
@@ -441,6 +561,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             if self.server.first_seen is None:
                 self.server.first_seen = time.time()
             parsed = urlparse(self.path)
+            if not self._check_auth(parsed.path):
+                return
             if parsed.path in ("/", "/index.html"):
                 html = page.get_page(APP_VERSION, APP_VENDOR, _homepage(),
                                      is_admin()).encode("utf-8")
@@ -629,6 +751,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             if self.server.first_seen is None:
                 self.server.first_seen = time.time()
             parsed = urlparse(self.path)
+            if not self._check_auth(parsed.path):
+                return
             if parsed.path == "/api/shutdown":
                 self.send_json({"ok": True})
                 threading.Thread(target=self._shutdown_server, daemon=True).start()

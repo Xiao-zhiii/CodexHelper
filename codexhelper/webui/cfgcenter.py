@@ -13,28 +13,22 @@
 from __future__ import annotations
 
 import ctypes
-import argparse
 import json
 import os
 import platform
 import re
 import shutil
 import sqlite3
-import socket
 import subprocess
 import sys
-import threading
 import time
 import traceback
-import webbrowser
 from dataclasses import dataclass
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 from .. import logs
 
@@ -3538,9 +3532,15 @@ HTML_PAGE = r"""<!doctype html>
     }
 
     async function postJson(url, payload) {
+      // X-CH-Token：本地服务的写操作令牌，由 page.py 渲染页面时注入到
+      // window.CH_TOKEN。端口写在 port.txt，本机任何进程都能直达这些端点，
+      // 少了这个头服务端会回 401。
       const response = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CH-Token": window.CH_TOKEN || ""
+        },
         body: JSON.stringify(payload)
       });
       const data = await response.json();
@@ -3851,7 +3851,9 @@ HTML_PAGE = r"""<!doctype html>
       if (cc) params.set("cc", cc);
       if (codexPlus) params.set("codexPlus", codexPlus);
       params.set("sensitive", $("#sensitiveToggle").checked ? "1" : "0");
-      const response = await fetch(`/api/snapshot?${params.toString()}`);
+      const response = await fetch(`/api/snapshot?${params.toString()}`, {
+        headers: { "X-CH-Token": window.CH_TOKEN || "" }
+      });
       state.data = await response.json();
       render();
     }
@@ -3932,7 +3934,10 @@ HTML_PAGE = r"""<!doctype html>
       }
     });
     $("#shutdownBtn").addEventListener("click", async () => {
-      await fetch("/api/shutdown", { method: "POST" });
+      await fetch("/api/shutdown", {
+        method: "POST",
+        headers: { "X-CH-Token": window.CH_TOKEN || "" }
+      });
       document.body.innerHTML = '<div class="shell"><div class="panel content"><h1>Codex Helper 已关闭</h1><p class="subtitle">可以关闭这个窗口了。</p></div></div>';
     });
 
@@ -3944,156 +3949,3 @@ HTML_PAGE = r"""<!doctype html>
 </body>
 </html>
 """
-
-
-class CodexHelperServer(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]) -> None:
-        super().__init__(server_address, handler_class)
-        self.last_seen = time.time()
-
-
-class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "CodexHelper/1.0"
-
-    def do_GET(self) -> None:
-        try:
-            self.server.last_seen = time.time()
-            parsed = urlparse(self.path)
-            if parsed.path in ("/", "/index.html"):
-                self.send_bytes(HTML_PAGE.encode("utf-8"), "text/html; charset=utf-8")
-                return
-            if parsed.path == "/api/ping":
-                self.send_json({"ok": True})
-                return
-            if parsed.path == "/api/snapshot":
-                snapshot = build_snapshot(parse_qs(parsed.query))
-                self.send_json(snapshot)
-                return
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-        except Exception as exc:  # noqa: BLE001 - request failures must be logged
-            write_exception_log("GET 请求处理失败", exc, path=self.path)
-            self.send_json({"ok": False, "errors": [str(exc)]}, HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    def do_POST(self) -> None:
-        try:
-            self.server.last_seen = time.time()
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/shutdown":
-                self.send_json({"ok": True})
-                write_log("INFO", "用户关闭 Codex Helper")
-                threading.Thread(target=self._shutdown_server, daemon=True).start()
-                return
-            if parsed.path == "/api/test-provider":
-                self.send_json(handle_test_provider(self.read_json_body()))
-                return
-            if parsed.path == "/api/test-all-providers":
-                self.send_json(handle_test_all_providers(self.read_json_body()))
-                return
-            if parsed.path == "/api/repair-codex":
-                self.send_json(handle_repair_codex(self.read_json_body()))
-                return
-            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
-        except Exception as exc:  # noqa: BLE001 - request failures must be logged
-            write_exception_log("POST 请求处理失败", exc, path=self.path)
-            self.send_json({"ok": False, "errors": [str(exc)]}, HTTPStatus.INTERNAL_SERVER_ERROR)
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - BaseHTTPRequestHandler API
-        return
-
-    def read_json_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8", errors="replace")
-        data = json.loads(body)
-        return data if isinstance(data, dict) else {}
-
-    def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send_bytes(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            "application/json; charset=utf-8",
-            status,
-        )
-
-    def send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _shutdown_server(self) -> None:
-        time.sleep(0.2)
-        self.server.shutdown()
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
-
-
-def open_browser(url: str) -> None:
-    if platform.system() == "Windows":
-        candidates = [
-            Path(os.environ.get("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
-            Path(os.environ.get("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
-            Path(os.environ.get("ProgramFiles", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-            Path(os.environ.get("ProgramFiles(x86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-        ]
-        for browser in candidates:
-            if browser.exists():
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.Popen([str(browser), f"--app={url}"], creationflags=creationflags)
-                return
-    webbrowser.open(url)
-
-
-def monitor_idle(server: CodexHelperServer, timeout_seconds: int = 45) -> None:
-    while True:
-        time.sleep(5)
-        if time.time() - server.last_seen > timeout_seconds:
-            server.shutdown()
-            return
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--port", type=int, default=0)
-    return parser.parse_known_args()[0]
-
-
-def self_test() -> int:
-    snapshot = build_snapshot({"sensitive": ["0"]})
-    required_sections = ("system", "paths", "config", "auth", "ccSwitch", "codexPlus")
-    if not all(section in snapshot for section in required_sections):
-        return 1
-    if not snapshot["system"]:
-        return 1
-    return 0
-
-
-def main() -> None:
-    args = parse_args()
-    if args.self_test:
-        raise SystemExit(self_test())
-
-    port = args.port or find_free_port()
-    server = CodexHelperServer(("127.0.0.1", port), RequestHandler)
-    url = f"http://127.0.0.1:{port}/"
-    threading.Thread(target=monitor_idle, args=(server,), daemon=True).start()
-    if not args.no_browser:
-        threading.Timer(0.3, open_browser, args=(url,)).start()
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-
-
-if __name__ == "__main__":
-    main()

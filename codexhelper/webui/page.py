@@ -22,6 +22,13 @@ VERSION = ""
 VENDOR = "小枳ai分享"
 HOMEPAGE = ""
 
+# 访问令牌：由 webui\server.py 在渲染前注入（见 server.get_api_token）。
+# 页面渲染时写进 window.CH_TOKEN，之后所有 /api/* 请求都要带上它——
+# 端口写在 port.txt，本机任意进程都能直达端点，没有这道校验等于敞着门。
+# 单独跑 get_page 的测试（preflight / test_deps_headless）这里为空串，
+# 不影响它们校验页面结构与 JS 语法。
+API_TOKEN = ""
+
 # ------------------------------------------------------- 导航分组定义 ----
 # 结构：(分组名, ((页签 id, 显示名), ...))
 # 第一个分组的第一个页签为默认激活项（也可由 default_tab 显式指定）。
@@ -112,6 +119,16 @@ def _render_tab_nav(groups=TAB_GROUPS, default_tab: str = "") -> str:
 
 def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str:
     html = cfgcenter.HTML_PAGE
+
+    # ---------- ⓪ 访问令牌：注入到第一个 <script> 的最开头 ----------
+    # 必须早于 cfgcenter 原生 JS 执行，否则它的 postJson 拿不到令牌。
+    # 用 window.CH_TOKEN 而不是 const，避免后定义的代码陷入 TDZ。
+    _script_tag = "<script>"
+    assert _script_tag in html, "cfgcenter.HTML_PAGE 缺少 <script> 标签"
+    html = html.replace(
+        _script_tag,
+        _script_tag + "\n    window.CH_TOKEN = " + json_dumps(API_TOKEN) + ";",
+        1)
 
     # ---------- ① CSS 覆盖与新增组件 ----------
     # 说明：品牌色、明暗模式、按钮/徽章语义色已全部收敛到 cfgcenter 的设计令牌。
@@ -564,6 +581,34 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     # ---------- ⑤ 任务系统 JS（注入到 </script> 前）----------
     js = """
+    /* ==================== 统一请求层 ====================
+       改造前：13 处 fetch 各自为政——有的 .then(r => r.json())，有的先判
+       res.ok，有的什么都不判直接当 JSON 用（于是 401/500 会在 json() 处
+       炸出一个看不懂的 SyntaxError，真正的错误信息反被吞掉）。
+       改造后统一三件事：① 自动带访问令牌 ② 非 2xx 一律抛带服务端消息的
+       Error ③ 统一解析 JSON。调用方只需要 api(path, opts)。 */
+    function apiHeaders(extra) {
+      const base = { "X-CH-Token": window.CH_TOKEN || "" };
+      return extra ? Object.assign(base, extra) : base;
+    }
+
+    async function api(path, opts) {
+      opts = opts || {};
+      const res = await fetch(path, Object.assign({}, opts, {
+        headers: apiHeaders(opts.headers)
+      }));
+      const text = await res.text().catch(function () { return ""; });
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+      if (!res.ok) {
+        const detail = data
+          ? ((data.errors || []).join("；") || data.error || data.message || text)
+          : text;
+        throw new Error(String(detail || ("HTTP " + res.status)).slice(0, 300));
+      }
+      return data;
+    }
+
     /* ==================== 全局错误兜底（必须最先注册）====================
        页面 JS 一旦抛错，整段 script 会中断，所有渲染静默失效——
        表现就是"卡片全空白"，而后端日志干干净净，极难定位。
@@ -573,7 +618,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         try {
           fetch("/api/client-error", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: apiHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify(Object.assign({
               message: String(msg || "未知错误").slice(0, 500),
               kind: kind || "onerror"
@@ -655,8 +700,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
     }
 
     async function apiState() {
-      const r = await fetch("/api/state");
-      return await r.json();
+      return await api("/api/state");
     }
 
     async function startTask(action, params) {
@@ -756,8 +800,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
     async function pollJob(id) {
       let job;
       try {
-        const r = await fetch("/api/task?id=" + encodeURIComponent(id));
-        job = await r.json();
+        job = await api("/api/task?id=" + encodeURIComponent(id));
       } catch (error) {
         job = { id: id, status: "running", logs: [], progress: null };
         setTimeout(() => pollJob(id), 1500);
@@ -851,8 +894,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     async function loadDeps(force) {
       try {
-        const r = await fetch("/api/deps-scan" + (force ? "?force=1" : ""));
-        const d = await r.json();
+        const d = await api("/api/deps-scan" + (force ? "?force=1" : ""));
         renderDeps(d);
         return d;
       } catch (e) {
@@ -924,8 +966,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     async function loadUwp() {
       try {
-        const r = await fetch("/api/uwp-scan");
-        const d = await r.json();
+        const d = await api("/api/uwp-scan");
         renderUwp(d);
         return d;
       } catch (e) {
@@ -946,12 +987,11 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         st.textContent = "正在" + (enable ? "开启" : "关闭") + "豁免…";
       }
       try {
-        const r = await fetch("/api/uwp-apply", {
+        const d = await api("/api/uwp-apply", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: id, enable: enable })
         });
-        const d = await r.json();
         // 失败也会带回最新 scan，照常渲染，避免界面停在旧状态
         if (d.scan) renderUwp(d.scan);
         if (st) {
@@ -1234,8 +1274,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       if (HIST.filter !== "") q.set("archived", HIST.filter);
       if (kw) q.set("kw", kw);
       try {
-        const r = await fetch("/api/codex-threads?" + q.toString());
-        const d = await r.json();
+        const d = await api("/api/codex-threads?" + q.toString());
         if (!d.ok) {
           $("#histList").innerHTML = '<div class="empty">'
             + escapeHtml(d.error || "读取失败") + '</div>';
@@ -1247,7 +1286,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
           + escapeHtml(error.message) + '</div>';
       }
       try {
-        const p = await fetch("/api/codex-paths").then(x => x.json());
+        const p = await api("/api/codex-paths");
         renderHistPaths(p);
       } catch (error) { /* 路径诊断失败不阻塞列表 */ }
     }
@@ -1356,7 +1395,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
       const kw = $("#logKw").value.trim();
       if (kw) q.set("kw", kw);
       try {
-        const d = await fetch("/api/codex-logs?" + q.toString()).then(x => x.json());
+        const d = await api("/api/codex-logs?" + q.toString());
         if (!d.ok) {
           $("#logList").innerHTML = '<div class="empty">'
             + escapeHtml(d.error || "读取失败") + '</div>';
@@ -1369,7 +1408,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
           + escapeHtml(error.message) + '</div>';
       }
       try {
-        renderLogSummary(await fetch("/api/codex-logs-summary").then(x => x.json()));
+        renderLogSummary(await api("/api/codex-logs-summary"));
       } catch (error) { /* 概览失败不阻塞 */ }
     }
 
@@ -1395,7 +1434,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
 
     async function loadHelperLog() {
       try {
-        const d = await fetch("/api/helper-log?lines=200").then(x => x.json());
+        const d = await api("/api/helper-log?lines=200");
         const box = $("#helperLog");
         box.textContent = d.ok ? (d.text || "（空）")
           : ("未找到：" + (d.error || "不可用"));
@@ -1464,7 +1503,7 @@ def _build_html(version: str, vendor: str, homepage: str, is_admin: bool) -> str
         if (st.detect && st.detect.info) renderInstallDetect(st.detect.info, st.detect.gpt || {});
         // 运行时依赖：/api/state 已带，直接渲染并按需弹提示（启动自动检测）
         if (st.deps) { renderDeps(st.deps); }
-        const appx = await fetch("/api/appx").then(r => r.json());
+        const appx = await api("/api/appx");
         window.CH_INSTALLED = appx.version || null;
         renderAppxCurrent(appx.pkg);
         if (!(st.detect && st.detect.info)) refreshDetect();

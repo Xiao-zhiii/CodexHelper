@@ -24,11 +24,23 @@ except Exception:
 sys.path.insert(0, Path(__file__).resolve().parent.as_posix())
 
 from codexhelper import logs  # noqa: E402
+
+# 导入 server 模块会立刻把「本进程」的令牌写进 token.txt，盖掉用户正在运行的
+# 那一个实例留下的值。先备份，§2b 断言完再还原，别影响用户手上的实例。
+_TOKEN_FILE = logs.LOG_DIR / "token.txt"
+_TOKEN_FILE_BACKUP = (_TOKEN_FILE.read_text(encoding="utf-8", errors="replace")
+                      if _TOKEN_FILE.is_file() else None)
+
+from codexhelper.webui import server as webui_server  # noqa: E402
 from codexhelper.webui.server import CHServer, RequestHandler  # noqa: E402
 
 
 _results = []
 _bad = []
+
+# 除 /、/favicon.ico、/api/ping 外，所有 /api/* 都要带 X-CH-Token。
+# 测试客户端也得带上，否则一律 401——这本身就是本文件要守住的行为。
+_TOKEN = webui_server.get_api_token()
 
 
 def ok(name, cond):
@@ -43,15 +55,32 @@ def section(t):
     print(f"== {t} ==")
 
 
-def get(url):
-    with urllib.request.urlopen(url, timeout=10) as resp:
-        return resp.read().decode("utf-8")
+def raw_get(url, token=True):
+    """返回 (状态码, 响应体)；token=False 表示不带头，用于验证鉴权。"""
+    headers = {}
+    if token is not False:
+        headers["X-CH-Token"] = token if isinstance(token, str) else _TOKEN
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
 
 
-def post(url, data):
+def get(url, token=True):
+    code, body = raw_get(url, token)
+    if code != 200:
+        raise AssertionError(f"GET {url} 返回 {code}：{body[:200]}")
+    return body
+
+
+def post(url, data, token=True):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=body,
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if token is not False:
+        headers["X-CH-Token"] = token if isinstance(token, str) else _TOKEN
+    req = urllib.request.Request(url, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.read().decode("utf-8")
 
@@ -85,6 +114,38 @@ try:
 
     base = f"http://127.0.0.1:{port}"
     ok("/api/ping 通", "ok" in get(base + "/api/ping"))
+
+    # ---- 2b. API 鉴权 ----
+    # 端口写在 %LOCALAPPDATA%\CodexHelper\port.txt，本机任意进程都能直达端点，
+    # 其中 shutdown / repair / 删会话 / 装依赖都是危险写操作，必须卡住。
+    section("2b. API 鉴权")
+    ok("/api/ping 免鉴权（单实例检测依赖它）",
+       raw_get(base + "/api/ping", token=False)[0] == 200)
+    code, _ = raw_get(base + "/api/helper-status", token=False)
+    ok("不带令牌 → 401", code == 401)
+    code, _ = raw_get(base + "/api/helper-status", token="wrong-token-value")
+    ok("错误令牌 → 401", code == 401)
+    code, _ = raw_get(base + "/api/helper-status")
+    ok("正确令牌 → 200", code == 200)
+    # 危险写操作同样要拦（这里只验证拦截，不真的执行）
+    code, _ = raw_get(base + "/api/codex-threads?limit=1", token=False)
+    ok("删/读会话端点不带令牌 → 401", code == 401)
+
+    # 令牌落盘（交接文档 §12.13.3 选 a）：不落盘的话 §七 那套外部排查命令
+    # 全部 401，"AI 友好"就是空话。这里守住"落了盘、且能用"。
+    ok("令牌文件路径在 %LOCALAPPDATA%\\CodexHelper\\token.txt",
+       "CodexHelper" in str(webui_server.TOKEN_FILE)
+       and webui_server.TOKEN_FILE.name == "token.txt")
+    ok("令牌文件已生成", webui_server.TOKEN_FILE.is_file())
+    disk_token = webui_server.TOKEN_FILE.read_text(encoding="utf-8").strip()
+    ok("令牌文件内容与进程令牌一致", disk_token == _TOKEN)
+    ok("令牌不含空白字符（便于命令行读取）",
+       bool(disk_token) and not any(c.isspace() for c in disk_token))
+    code, _ = raw_get(base + "/api/helper-status", token=disk_token)
+    ok("用令牌文件里的令牌能调通受保护端点", code == 200)
+    # 还原用户实例留下的令牌（备份见文件头）
+    if _TOKEN_FILE_BACKUP is not None:
+        _TOKEN_FILE.write_text(_TOKEN_FILE_BACKUP, encoding="utf-8")
 
     status = json.loads(get(base + "/api/helper-status"))
     ok("/api/helper-status ok", status.get("ok"))
