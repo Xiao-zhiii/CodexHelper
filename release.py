@@ -155,11 +155,28 @@ notes = [
 ]
 for c in new_commits:
     notes.append(f"- {c}")
+# 安装包是否存在决定下载段怎么写：单文件版缺 VC++ 会直接打不开，
+# 因此只要安装包在场就优先推荐它（见交接文档 §八）。
+_setup_name = f"CodexHelper-Setup-{APP_VERSION}.exe"
+_setup_path = HERE / "dist" / _setup_name
+if _setup_path.is_file():
+    _dl = [
+        f"**推荐**：下载 `{_setup_name}`（{_setup_path.stat().st_size / 1048576:.0f} MB），"
+        f"双击安装即可——**安装时会自动装好 VC++ 运行库**，并创建开始菜单快捷方式。",
+        "",
+        f"已有运行环境的可下载 `CodexHelper.exe` 绿色版"
+        f"（{DIST_EXE.stat().st_size / 1048576:.0f} MB，免安装）；"
+        f"**若系统缺 VC++ 运行库会打不开**，此时请用上面的安装包。",
+    ]
+else:
+    _dl = [
+        f"下载 `CodexHelper.exe`，双击运行即可（无需安装 Node 或 Python）。",
+    ]
 notes += [
     "",
     "### 下载",
     "",
-    f"下载 `CodexHelper.exe`，双击运行即可（无需安装 Node 或 Python）。",
+] + _dl + [
     "",
     "> 若系统缺少 WebView2 运行时，程序会自动降级为 tkinter 界面；",
     "> 装上 WebView2 后自动恢复完整界面。",
