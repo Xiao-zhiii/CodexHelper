@@ -11,6 +11,10 @@
 3. **关键 DOM 结构**：历史 / 日志两个 tab 的容器还在（防止改版时误删）。
 4. **三个新模块的沙箱自测**：跑 `test_codex_modules_headless.py`。
 5. **打包资源**：`installer.ico` 存在且是多帧 ICO（少帧会导致任务栏图标糊）。
+6. **资产名版本号一致性**：README 里的 `CodexHelper-Setup-x.y.z.exe`、
+   写死的 Release tag、`CodexHelper.iss` 的 `MyAppVersion` 三处手写的版本号
+   都必须等于 `APP_VERSION`。v1.8.2 发版时 README 漏改（仍是 1.8.1），
+   靠人眼没发现——这里把它钉成门禁。
 
 ## 用法
 
@@ -202,6 +206,54 @@ if rel_py.is_file():
         check("release.py 语法正确", True)
     except SyntaxError as exc:
         check("release.py 语法正确", False, f"第 {exc.lineno} 行")
+
+# ------------------------------------------------- 6. 资产名版本号一致性 ----
+# v1.8.2 事故：release notes 里的资产名由 release.py 带版本号自动生成，
+# 但 README 里的安装包文件名是**手写的**，发 1.8.2 时 README 仍写着
+# Setup-1.8.1.exe，从发版到补传都没人发现。
+#
+# 根因是"版本号散落在多处，改的时候靠人记得全改"。这里把所有手写的
+# 版本号钉死：漏改任何一处，preflight 直接 FAIL。
+section("6. 资产名版本号一致性")
+REPO_DIR = SRC.parent / "NodeCodexSetup"
+
+readme = REPO_DIR / "README.md"
+if not readme.is_file():
+    readme = SRC / "README.md"
+
+if not readme.is_file():
+    print("  [SKIP] 未找到 README.md，跳过资产名校验")
+elif not APP_VERSION:
+    print("  [SKIP] APP_VERSION 不可用，跳过资产名校验")
+else:
+    rd = readme.read_text(encoding="utf-8", errors="replace")
+    # 安装包资产名：README 里必须出现，且版本号只能是当前的
+    vers = re.findall(r"CodexHelper-Setup-(\d+\.\d+\.\d+)\.exe", rd)
+    check("README 引用了安装包资产名", len(vers) > 0, f"{len(vers)} 处")
+    stale = sorted({v for v in vers if v != APP_VERSION})
+    check(f"README 安装包版本号与 APP_VERSION 一致（{APP_VERSION}）",
+          not stale, "" if not stale else f"残留旧版本号 {stale}")
+    # 下载链接若写死 tag，也必须跟上（相对链接 ../../releases 不受影响）
+    tags = re.findall(r"releases/tag/v(\d+\.\d+\.\d+)", rd)
+    stale_tag = sorted({t for t in tags if t != APP_VERSION})
+    check(f"README 写死的 Release tag 与 APP_VERSION 一致（{APP_VERSION}）",
+          not stale_tag,
+          "" if not stale_tag else f"残留旧 tag {stale_tag}")
+
+iss = SRC / "CodexHelper.iss"
+if not iss.is_file():
+    iss = REPO_DIR / "CodexHelper.iss"
+check("存在 CodexHelper.iss", iss.is_file())
+if iss.is_file():
+    iss_text = iss.read_text(encoding="utf-8", errors="replace")
+    m_iss = re.search(r'#define\s+MyAppVersion\s+"([^"]+)"', iss_text)
+    check("CodexHelper.iss 解析出 MyAppVersion", m_iss is not None)
+    if m_iss:
+        check(f"iss MyAppVersion 与 APP_VERSION 一致（{m_iss.group(1)}）",
+              m_iss.group(1) == APP_VERSION)
+    # 安装包输出名走 {#MyAppVersion}，不用手写版本号
+    check("iss 输出文件名使用 {#MyAppVersion} 变量",
+          "CodexHelper-Setup-{#MyAppVersion}" in iss_text)
 
 print()
 failed = [n for n, c in REPORT if not c]

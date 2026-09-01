@@ -1,7 +1,7 @@
 ; Codex 小帮手 安装脚本（Inno Setup 6）
 ;
 ; 编译：ISCC.exe CodexHelper.iss
-; 产出：Output\CodexHelper-Setup-1.8.0.exe
+; 产出：Output\CodexHelper-Setup-{#MyAppVersion}.exe
 ;
 ; 设计要点
 ; --------
